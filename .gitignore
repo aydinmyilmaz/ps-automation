@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Generated outputs (large, reproducible)
+output/
+
+# Keep only active template PSD in git
+data/*.psd
+!data/text_only_2.psd
+
+# Frontend artifacts
+frontend/node_modules/
+frontend/dist/
