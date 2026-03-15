@@ -1,11 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+project_root = Path('/Users/aydin/Desktop/apps/ps-automation')
+single_save_config = project_root / 'config' / 'supabase_single_save.json'
+datas = [
+    (str(project_root / 'output' / 'gmail_name_sync' / '05_curated'), 'data/final_names'),
+    (str(project_root / 'data' / 'selected-psd'), 'data/selected-psd'),
+]
+if single_save_config.exists():
+    datas.append((str(single_save_config), 'config'))
 
 a = Analysis(
     ['/Users/aydin/Desktop/apps/ps-automation/scripts/desktop_qt_app.py'],
     pathex=['/Users/aydin/Desktop/apps/ps-automation/scripts'],
     binaries=[],
-    datas=[('/Users/aydin/Desktop/apps/ps-automation/output/gmail_name_sync/05_curated', 'data/final_names'), ('/Users/aydin/Desktop/apps/ps-automation/data/selected-psd', 'data/selected-psd')],
+    datas=datas,
     hiddenimports=['onecall_unattended_batch', 'app_paths'],
     hookspath=[],
     hooksconfig={},

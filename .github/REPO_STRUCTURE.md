@@ -17,6 +17,7 @@ ps-automation/
 │   ├── desktop_qt_app.py      # Qt/PySide6 native batch app
 │   ├── batch_desktop_app.py   # Tkinter batch app (legacy)
 │   ├── desktop_web_app.py     # Web-based batch app (fallback)
+│   ├── single_supabase_export.py  # Optional custom-mode archive + Supabase import helper
 │   └── build_desktop_app.py   # PyInstaller packager
 │
 ├── data/
@@ -67,6 +68,12 @@ Everything in `output/` is gitignored and reproducible.
 - `batch_runs/` = batch process results
 - `archive/` = old test outputs (can be deleted anytime)
 
+### Desktop single-save exports
+- Optional custom-mode saves are archived under `~/Desktop/ps_single_supabase_exports/`
+- The desktop app writes to Supabase directly using `config/supabase_single_save.json`
+- That config is local-only and can be bundled into packaged desktop builds
+- These files are user-local and are not tracked in git
+
 ### What gets committed
 - `scripts/*.py` (all backend code)
 - `frontend/src/` (React components + styles)
@@ -74,6 +81,7 @@ Everything in `output/` is gitignored and reproducible.
 - Root config: `start.sh`, `package.json`, `.gitignore`, `README.md`
 - Launcher scripts: `start_desktop_qt.*`
 - Example config files in `config/*.example.json`
+- Local bundle config template: `config/supabase_single_save.example.json`
 - Build metadata in `build/spec/`
 
 ### What stays local (gitignored)

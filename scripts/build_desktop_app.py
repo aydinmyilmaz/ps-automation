@@ -17,6 +17,7 @@ DIST_DIR = PROJECT_ROOT / "dist_desktop"
 WORK_DIR = PROJECT_ROOT / "build" / "pyinstaller"
 SPEC_DIR = PROJECT_ROOT / "build" / "spec"
 RELEASE_DIR = PROJECT_ROOT / "release"
+SINGLE_SAVE_CONFIG = PROJECT_ROOT / "config" / "supabase_single_save.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,8 +83,15 @@ def build_pyinstaller(app_name: str) -> Path:
         pyinstaller_data_arg(PROJECT_ROOT / "output" / "gmail_name_sync" / "05_curated", "data/final_names"),
         "--add-data",
         pyinstaller_data_arg(PROJECT_ROOT / "data" / "selected-psd", "data/selected-psd"),
-        str(ENTRYPOINT),
     ]
+    if SINGLE_SAVE_CONFIG.exists():
+        cmd.extend(
+            [
+                "--add-data",
+                pyinstaller_data_arg(SINGLE_SAVE_CONFIG, "config"),
+            ]
+        )
+    cmd.append(str(ENTRYPOINT))
     print("Running:", " ".join(cmd))
     subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)
     return artifact_path(app_name)

@@ -1,0 +1,7 @@
+{
+  "supabaseUrl": "https://your-project.supabase.co",
+  "serviceRoleKey": "your-service-role-key",
+  "storageBucket": "generated-maps",
+  "cacheTable": "ai_text_design_cache",
+  "storageFolder": "ai-text-design-cache"
+}

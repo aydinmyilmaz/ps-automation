@@ -22,12 +22,15 @@ from app_paths import (
     bundled_default_psd,
     bundled_names_file,
     default_batch_output_dir,
+    default_single_supabase_export_dir,
     desktop_settings_file,
     gmail_derived_dir,
     gmail_ranked_dir,
     is_frozen_app,
+    single_save_supabase_config_file,
 )
 from ps_single_renderer import STYLE_CHOICES, run_jsx, sanitize_filename
+from single_supabase_export import archive_custom_render_outputs, import_archived_run, load_single_save_config
 
 try:
     from PySide6.QtCore import QProcess, QTimer, Qt
@@ -698,6 +701,22 @@ QScrollBar::handle:vertical {
         self.auto_open_custom_check = QCheckBox("Auto-open PNG after render")
         self.auto_open_custom_check.setChecked(True)
         custom_layout.addWidget(self.auto_open_custom_check)
+        save_row = QHBoxLayout()
+        save_row.setSpacing(6)
+        self.save_single_supabase_check = QCheckBox("Save single render to Supabase")
+        save_row.addWidget(self.save_single_supabase_check)
+        save_row.addWidget(
+            self._help_icon(
+                f"If enabled, custom-mode PNGs are archived under "
+                f"{default_single_supabase_export_dir()} and then imported into Supabase "
+                "using the shared PS-local cache schema."
+            )
+        )
+        save_row.addStretch(1)
+        custom_layout.addWidget(self._wrap(save_row))
+        custom_layout.addWidget(
+            QLabel(f"Uses bundled config: {single_save_supabase_config_file()}")
+        )
         settings_layout.addWidget(self.custom_section)
 
         self.letter_section = QGroupBox("Letter Coverage")
@@ -1567,6 +1586,8 @@ QScrollBar::handle:vertical {
             if not parsed:
                 raise ValueError("Custom names are empty. Enter at least one name.")
             selected_name = parsed[0]
+            if self.save_single_supabase_check.isChecked():
+                load_single_save_config()
             if len(parsed) > 1:
                 self.append_log(
                     f"[APP] Custom mode uses only first name: {selected_name} "
@@ -1586,6 +1607,7 @@ QScrollBar::handle:vertical {
                 "mode": mode,
                 "styles": styles,
                 "custom_name": selected_name,
+                "save_single_supabase": self.save_single_supabase_check.isChecked(),
                 "names_file": str(names_file),
                 "chunk_size": chunk_size,
                 "restart_every_chunks": restart_every_chunks,
@@ -1626,6 +1648,7 @@ QScrollBar::handle:vertical {
         self._run_log_path().write_text("", encoding="utf-8")
         self.append_log("\n[APP] START " + " ".join(cmd) + "\n")
         self._append_run_log("[APP] START " + " ".join(cmd) + "\n")
+        started_at = time.time()
 
         try:
             pid = self._start_worker_detached(cmd, reset_log=False)
@@ -1634,6 +1657,9 @@ QScrollBar::handle:vertical {
             self._set_status("start failed")
             self.append_log(f"[APP] Failed to start detached worker: {exc}\n")
             return
+        self.last_run_meta["worker_pid"] = pid
+        self.last_run_meta["post_run_handled"] = False
+        self.last_run_meta["started_at"] = started_at
         self._set_status(f"running (pid {pid})")
 
     def stop_run(self) -> None:
@@ -1668,6 +1694,7 @@ QScrollBar::handle:vertical {
                 if pid > 0:
                     subprocess.run(["pkill", "-P", str(pid)], check=False, capture_output=True, text=True)
                 subprocess.run(["pkill", "-f", "osascript -"], check=False, capture_output=True, text=True)
+        self.last_run_meta["post_run_handled"] = True
         self._set_status("stopped")
 
     def on_proc_output(self) -> None:
@@ -1689,7 +1716,7 @@ QScrollBar::handle:vertical {
         exit_code = self.proc.exitCode()
         self._set_status("idle" if exit_code == 0 else f"idle (exit {exit_code})")
         self.progress_bar.setVisible(False)
-        self._handle_custom_post_run(exit_code)
+        self._finalize_last_run()
         self.proc = None
 
     def _auto_resume_incomplete_run(self) -> None:
@@ -1714,6 +1741,8 @@ QScrollBar::handle:vertical {
     def refresh_status(self) -> None:
         self.current_output = self._current_output_path()
         progress_data: dict[str, object] | None = None
+        live_pid = self._read_worker_pid()
+        allow_post_run = True
         progress = self.current_output / "progress.json"
         if progress.exists():
             try:
@@ -1728,17 +1757,18 @@ QScrollBar::handle:vertical {
                     self.progress_bar.setValue(done)
                     self.progress_bar.setFormat(f"{done} / {total}  ({rate} s/item)")
                     self.progress_bar.setVisible(True)
-                live_pid = self._read_worker_pid()
                 if live_pid:
                     self._set_status(f"running (pid {live_pid})  |  {done}/{total}  |  {rate} s/item")
                 else:
                     self._set_status(f"done {done}/{total}  |  {rate} s/item")
                 if total > 0 and remaining > 0 and not live_pid:
+                    allow_post_run = False
                     self._auto_resume_incomplete_run()
+                    live_pid = self._read_worker_pid()
             except (json.JSONDecodeError, ValueError, KeyError):
                 pass
-        elif self._read_worker_pid():
-            self._set_status(f"running (pid {self._read_worker_pid()})")
+        elif live_pid:
+            self._set_status(f"running (pid {live_pid})")
         log_path = self._run_log_path()
         txt = tail_text(log_path)
         if txt and txt.strip() != self.log.toPlainText().strip():
@@ -1747,6 +1777,8 @@ QScrollBar::handle:vertical {
         if str(self.mode_combo.currentData()) == "full":
             self.refresh_letter_summary()
         self.refresh_scratch_status()
+        if not live_pid and allow_post_run:
+            self._finalize_last_run()
 
     def _open_path(self, path: Path) -> None:
         try:
@@ -1760,24 +1792,97 @@ QScrollBar::handle:vertical {
         except Exception as exc:  # noqa: BLE001
             self.append_log(f"[APP] Failed to open path: {path} ({exc})\n")
 
-    def _handle_custom_post_run(self, exit_code: int) -> None:
-        if exit_code != 0:
-            return
-        if str(self.last_run_meta.get("mode", "")) != "custom":
-            return
+    def _progress_is_complete(self) -> bool:
+        progress = self.current_output / "progress.json"
+        if not progress.exists():
+            return False
+        try:
+            payload = json.loads(progress.read_text(encoding="utf-8"))
+            done = int(payload.get("done", 0))
+            total = int(payload.get("total", 0))
+            remaining = int(payload.get("remaining", max(total - done, 0)))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return False
+        return total > 0 and remaining == 0 and done >= total
+
+    def _custom_render_outputs(self) -> tuple[str, list[tuple[str, Path]]]:
         custom_name = str(self.last_run_meta.get("custom_name", "")).strip()
         styles = self.last_run_meta.get("styles")
         if not custom_name or not isinstance(styles, list):
-            return
+            return "", []
         render_name = custom_name.upper()
+        started_at = float(self.last_run_meta.get("started_at", 0.0))
+        fresh_outputs: list[tuple[str, Path]] = []
+        existing_outputs: list[tuple[str, Path]] = []
+        missing_styles: list[str] = []
+        stale_styles: list[str] = []
         for style in styles:
             out = self.current_output / sanitize_filename(str(style)) / f"{sanitize_filename(render_name)}.png"
-            if out.exists():
-                self.result_label.setText(f"Last Result: {render_name} ({style})")
-                self.append_log(f"[APP] Custom result ready: {out}\n")
-                if self.auto_open_custom_check.isChecked():
-                    self._open_path(out)
-                return
+            if not out.exists():
+                missing_styles.append(str(style))
+                continue
+            existing_outputs.append((str(style), out))
+            if out.stat().st_mtime >= max(0.0, started_at - 1.0):
+                fresh_outputs.append((str(style), out))
+            else:
+                stale_styles.append(str(style))
+        if fresh_outputs:
+            if missing_styles:
+                self.append_log(f"[APP] Missing custom PNG(s): {', '.join(missing_styles)}\n")
+            return render_name, fresh_outputs
+        if existing_outputs and self._progress_is_complete():
+            if stale_styles:
+                self.append_log("[APP] Reusing existing custom PNG(s) already present on disk.\n")
+            return render_name, existing_outputs
+        if missing_styles:
+            self.append_log(f"[APP] Missing custom PNG(s): {', '.join(missing_styles)}\n")
+        return render_name, []
+
+    def _finalize_last_run(self) -> None:
+        worker_pid = self.last_run_meta.get("worker_pid")
+        if not isinstance(worker_pid, int):
+            return
+        if bool(self.last_run_meta.get("post_run_handled", False)):
+            return
+        self.last_run_meta["post_run_handled"] = True
+        if str(self.last_run_meta.get("mode", "")) != "custom":
+            return
+        self._handle_custom_post_run()
+
+    def _handle_custom_post_run(self) -> None:
+        if str(self.last_run_meta.get("mode", "")) != "custom":
+            return
+        self.current_output = self._current_output_path()
+        render_name, outputs = self._custom_render_outputs()
+        if not render_name or not outputs:
+            self.append_log("[APP] Custom run finished but no PNGs were found.\n")
+            return
+        first_style, first_output = outputs[0]
+        self.result_label.setText(f"Last Result: {render_name} ({first_style})")
+        for style, out in outputs:
+            self.append_log(f"[APP] Custom result ready: {out} ({style})\n")
+        if self.auto_open_custom_check.isChecked():
+            self._open_path(first_output)
+        if not bool(self.last_run_meta.get("save_single_supabase", False)):
+            return
+        try:
+            archived_run = archive_custom_render_outputs(render_name, outputs)
+            self.append_log(f"[APP] Archived single export: {archived_run.run_root}\n")
+            import_result = import_archived_run(archived_run)
+            if import_result.output:
+                for line in import_result.output.splitlines():
+                    self.append_log(f"[SUPABASE] {line}\n")
+            if import_result.ok:
+                self.append_log(
+                    f"[APP] Supabase single-save completed for {render_name} "
+                    f"({len(archived_run.archived_renders)} PNGs).\n"
+                )
+            else:
+                self.append_log(
+                    f"[APP] Supabase single-save failed with exit code {import_result.returncode}.\n"
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"[APP] Supabase single-save failed: {exc}\n")
 
     def _save_settings(self) -> None:
         payload = {
@@ -1795,6 +1900,7 @@ QScrollBar::handle:vertical {
             "skip_done_letters": self.skip_done_letters_check.isChecked(),
             "custom_names": self.custom_names_edit.toPlainText(),
             "auto_open_custom": self.auto_open_custom_check.isChecked(),
+            "save_single_supabase": self.save_single_supabase_check.isChecked(),
         }
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -1830,6 +1936,7 @@ QScrollBar::handle:vertical {
         self.ps_exec_edit.setText(str(cfg.get("ps_exec", "")))
         self.custom_names_edit.setPlainText(str(cfg.get("custom_names", "")))
         self.auto_open_custom_check.setChecked(bool(cfg.get("auto_open_custom", True)))
+        self.save_single_supabase_check.setChecked(bool(cfg.get("save_single_supabase", False)))
         self.skip_done_letters_check.setChecked(bool(cfg.get("skip_done_letters", True)))
         saved_styles = cfg.get("styles", [])
         for name, cb in self.style_checks.items():

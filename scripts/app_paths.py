@@ -45,6 +45,11 @@ def documents_dir() -> Path:
     return candidate if candidate.exists() else Path.home()
 
 
+def desktop_dir() -> Path:
+    candidate = Path.home() / "Desktop"
+    return candidate if candidate.exists() else documents_dir()
+
+
 def default_output_base() -> Path:
     if is_frozen_app():
         return documents_dir() / APP_STORAGE_NAME / "output"
@@ -63,6 +68,16 @@ def default_batch_output_dir() -> Path:
 
 def default_web_output_dir() -> Path:
     return default_output_base() / "web_single"
+
+
+def default_single_supabase_export_dir() -> Path:
+    return desktop_dir() / "ps_single_supabase_exports"
+
+
+def single_save_supabase_config_file() -> Path:
+    if is_frozen_app():
+        return resource_path("config", "supabase_single_save.json")
+    return SOURCE_PROJECT_ROOT / "config" / "supabase_single_save.json"
 
 
 def bundled_names_file() -> Path:
