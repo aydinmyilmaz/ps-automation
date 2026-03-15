@@ -3,14 +3,30 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.png
+*env*
 
 # Generated outputs (large, reproducible)
 output/
 
-# Keep only active template PSD in git
+# Large/local-only design assets and name datasets
+data/final_names
+data/psd-files/
+data/selected-psd/
 data/*.psd
-!data/text_only_2.psd
 
 # Frontend artifacts
 frontend/node_modules/
 frontend/dist/
+
+archive/
+plan/
+credentials/
+config/*.json
+!config/*.example.json
+build/*
+!build/spec/
+!build/spec/**
+
+*desktop_batch_runs*
+*temp/

@@ -1,0 +1,31 @@
+{
+  "gmail_query": "in:anywhere from:(transaction@etsy.com)",
+  "from_contains": [
+    "etsy transactions"
+  ],
+  "subject_contains": [
+    "you made a sale on etsy"
+  ],
+  "name_patterns": [
+    "(?is)shipping address\\s*(?:\\r?\\n)+\\s*([^\\n<]{2,80})(?:\\r?\\n|$)",
+    "(?is)shipping address\\s+([A-Za-zÀ-ÖØ-öø-ÿ'’\\- ]{2,80}?)\\s+\\d"
+  ],
+  "ignore_if_contains": [
+    "@",
+    "http://",
+    "https://",
+    "order details",
+    "payment method",
+    "sku",
+    "qty",
+    "quantity"
+  ],
+  "drop_exact": [
+    "n/a",
+    "none",
+    "-"
+  ],
+  "min_name_chars": 2,
+  "max_name_chars": 40,
+  "max_name_words": 4
+}
