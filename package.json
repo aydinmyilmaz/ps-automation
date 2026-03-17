@@ -2,12 +2,17 @@
   "name": "ps-automation",
   "private": true,
   "version": "0.1.0",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.95.3",
+    "sharp": "^0.34.4"
+  },
   "scripts": {
     "dev": "bash start.sh",
     "start": "bash start.sh",
     "dev:frontend": "npm --prefix frontend run dev",
     "build:frontend": "npm --prefix frontend run build",
     "preview:frontend": "npm --prefix frontend run preview",
-    "dev:api": "python3 scripts/single_render_api.py"
+    "dev:api": "python3 scripts/single_render_api.py",
+    "import:ai-text-cache": "node scripts/import_ai_text_design_cache.mjs"
   }
 }

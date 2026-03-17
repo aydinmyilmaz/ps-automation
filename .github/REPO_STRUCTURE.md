@@ -4,6 +4,10 @@
 
 ```
 ps-automation/
+├── .github/
+│   ├── skills/                # Repo-local Copilot/Codex skills
+│   └── REPO_STRUCTURE.md      # Repo conventions and maintenance notes
+│
 ├── frontend/                  # React + Vite web UI
 │   ├── src/App.jsx            # Single name renderer component
 │   ├── src/styles.css         # Styling
@@ -100,6 +104,12 @@ Everything in `output/` is gitignored and reproducible.
 1. Create in `scripts/`
 2. Use `SCRIPTS_DIR` / `PROJECT_ROOT` pattern for paths
 3. Add `sys.path.insert(0, str(SCRIPTS_DIR))` before sibling imports if needed
+
+### New skill
+1. Create in `.github/skills/<skill-name>/`
+2. Put the reusable workflow in `SKILL.md`
+3. Add `references/` only when the skill body would otherwise get long
+4. Keep executable logic in the main repo, usually `scripts/`
 
 ### New PSD template
 1. Place in `data/selected-psd/`
