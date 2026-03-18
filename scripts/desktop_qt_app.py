@@ -5,11 +5,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -49,7 +51,6 @@ try:
         QLineEdit,
         QMainWindow,
         QMessageBox,
-        QPlainTextEdit,
         QProgressBar,
         QPushButton,
         QScrollArea,
@@ -120,7 +121,51 @@ def available_names_files() -> list[tuple[str, Path]]:
     add("Gmail in 3000  all", derived_dir / "gmail_names_in_3000_unprocessed_all.txt")
     add("Gmail fallback  top 106", derived_dir / "gmail_names_not_in_3000_unprocessed_top_106.txt")
     add("Gmail fallback  all", derived_dir / "gmail_names_not_in_3000_unprocessed_all.txt")
+    popular_dir = PROJECT_ROOT / "output" / "gmail_name_sync" / "08_popular_name_lists"
+    report_path = popular_dir / "popular_name_list_folder_report.json"
+    if report_path.exists():
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            payload = {}
+        all_file_raw = str(payload.get("allBatchesFile") or payload.get("allFile") or "").strip()
+        if all_file_raw:
+            add("Popular all batches", Path(all_file_raw))
+        batch_entries: list[tuple[int, int, Path]] = []
+        for row in payload.get("batches", []):
+            try:
+                batch_index = int(row.get("batchIndex"))
+                count = int(row.get("count"))
+                file_path = Path(str(row.get("file", "")).strip())
+            except (TypeError, ValueError):
+                continue
+            batch_entries.append((batch_index, count, file_path))
+        for batch_index, count, path in sorted(batch_entries, key=lambda item: item[0]):
+            add(f"Popular batch {batch_index}  {count} names", path)
+        return items
+
+    batch_entries: list[tuple[int, Path]] = []
+    for path in popular_dir.glob("popular_names_batch_*.txt"):
+        match = re.fullmatch(r"popular_names_batch_(\d+)\.txt", path.name)
+        if not match:
+            continue
+        batch_entries.append((int(match.group(1)), path))
+    for batch_index, path in sorted(batch_entries, key=lambda item: item[0]):
+        add(f"Popular batch {batch_index}", path)
     return items
+
+
+def normalize_saved_mode(mode: str) -> str:
+    value = mode.strip()
+    if value.startswith("test20_"):
+        try:
+            count = int(value.split("_", 1)[1])
+        except (TypeError, ValueError):
+            return "test20_1"
+        if count in {1, 5, 10, 20, 50}:
+            return value
+        return "test20_1"
+    return value or "full"
 
 
 @dataclass(frozen=True)
@@ -151,6 +196,84 @@ class LetterCoverage:
         if self.partial_names > 0:
             return f"{self.completed_names}/{self.total_names} names\n{self.partial_names} partial"
         return f"{self.completed_names}/{self.total_names} names\n{self.status_label()}"
+
+
+@dataclass(frozen=True)
+class ProcessedBatchReference:
+    output_dir: Path
+    psd_path: Path
+    psd_signature: str
+    names_file: Path | None
+    selected_names_path: Path
+    selected_keys: frozenset[str]
+
+
+def normalize_name_match_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.replace("-", " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip().casefold()
+    return normalized
+
+
+def normalize_psd_signature(value: Path | str) -> str:
+    path = Path(str(value).strip()) if str(value).strip() else Path("")
+    stem = path.stem if path.stem else path.name
+    return normalize_name_match_key(stem)
+
+
+def load_text_names(path: Path) -> list[str]:
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def processed_batch_references() -> list[ProcessedBatchReference]:
+    refs: list[ProcessedBatchReference] = []
+    seen_cfg: set[Path] = set()
+    roots = [PROJECT_ROOT / "output", PROJECT_ROOT]
+    for root in roots:
+        if not root.exists():
+            continue
+        for cfg_path in root.rglob("run_config.json"):
+            resolved_cfg = cfg_path.resolve()
+            if resolved_cfg in seen_cfg:
+                continue
+            seen_cfg.add(resolved_cfg)
+            selected_names_path = resolved_cfg.with_name("selected_names.txt")
+            if not selected_names_path.exists():
+                continue
+            try:
+                payload = json.loads(resolved_cfg.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            if str(payload.get("name_source", "")).strip() != "full":
+                continue
+            psd_raw = str(payload.get("psd_path", "")).strip()
+            if not psd_raw:
+                continue
+            try:
+                names = load_text_names(selected_names_path)
+            except OSError:
+                continue
+            selected_keys = frozenset(
+                normalize_name_match_key(name)
+                for name in names
+                if normalize_name_match_key(name)
+            )
+            if not selected_keys:
+                continue
+            names_file_raw = str(payload.get("names_file", "")).strip()
+            refs.append(
+                ProcessedBatchReference(
+                    output_dir=resolved_cfg.parent,
+                    psd_path=Path(psd_raw).expanduser(),
+                    psd_signature=normalize_psd_signature(psd_raw),
+                    names_file=Path(names_file_raw).expanduser() if names_file_raw else None,
+                    selected_names_path=selected_names_path,
+                    selected_keys=selected_keys,
+                )
+            )
+    refs.sort(key=lambda item: item.output_dir.name.casefold())
+    return refs
 
 
 @lru_cache(maxsize=4)
@@ -271,6 +394,8 @@ class MainWindow(QMainWindow):
         self.letter_coverage: dict[str, LetterCoverage] = {}
         self.last_run_meta: dict[str, object] = {}
         self.scratch_status_text = ""
+        self._names_warning_confirm_required = False
+        self._names_warning_dialog_text = ""
         self._syncing_letters = False
         self._stop_requested = False
         self._last_auto_resume_at = 0.0
@@ -433,6 +558,47 @@ QLabel#subtleMeta {
   color: #64748b;
   font-size: 11px;
 }
+QLabel#warningBox {
+  background: #fff7ed;
+  color: #9a3412;
+  border: 1.5px solid #fdba74;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+QLabel#infoBox {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border: 1.5px solid #bfdbfe;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+QLabel#errorBox {
+  background: #fef2f2;
+  color: #b91c1c;
+  border: 1.5px solid #fca5a5;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+QLabel#successBox {
+  background: #f0fdf4;
+  color: #15803d;
+  border: 1.5px solid #86efac;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+QFrame#singleSaveCard {
+  background: #f8fafc;
+  border: 1.5px solid #dbeafe;
+  border-radius: 10px;
+}
 QToolButton#helpIconBtn {
   background: #eff6ff;
   color: #1d4ed8;
@@ -584,6 +750,11 @@ QScrollBar::handle:vertical {
             ),
             self._wrap(names_row),
         )
+        self.names_warning_label = QLabel("")
+        self.names_warning_label.setObjectName("warningBox")
+        self.names_warning_label.setWordWrap(True)
+        self.names_warning_label.setVisible(False)
+        files_form.addRow("", self.names_warning_label)
 
         self.scratch_status_label = QLabel("Checking scratch disk...")
         self.scratch_status_label.setWordWrap(True)
@@ -632,16 +803,18 @@ QScrollBar::handle:vertical {
         mode_col.addWidget(
             self._label_with_help(
                 "Mode",
-                "Full uses the names txt file with letter filters. Test runs a small sample. Custom renders the first manual name only.",
+                "Full renders the selected names file. Test renders the first N names from the selected names file. Custom renders one typed name locally. Single renders one typed name and then imports it to Supabase.",
             )
         )
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Full  —  3000 names (letters filter)", "full")
-        self.mode_combo.addItem("Test  —  1 name", "test20_1")
-        self.mode_combo.addItem("Test  —  first 5", "test20_5")
-        self.mode_combo.addItem("Test  —  first 10", "test20_10")
-        self.mode_combo.addItem("Test  —  all 20", "test20_20")
-        self.mode_combo.addItem("Custom  —  manual list", "custom")
+        self.mode_combo.addItem("Full  —  names file", "full")
+        self.mode_combo.addItem("Test  —  first 1 name", "test20_1")
+        self.mode_combo.addItem("Test  —  first 5 names", "test20_5")
+        self.mode_combo.addItem("Test  —  first 10 names", "test20_10")
+        self.mode_combo.addItem("Test  —  first 20 names", "test20_20")
+        self.mode_combo.addItem("Test  —  first 50 names", "test20_50")
+        self.mode_combo.addItem("Custom  —  typed name", "custom")
+        self.mode_combo.addItem("Single  —  typed name + Supabase", "single")
         self.mode_combo.currentIndexChanged.connect(self.on_mode_change)
         mode_col.addWidget(self.mode_combo)
         row1.addLayout(mode_col, 3)
@@ -691,32 +864,105 @@ QScrollBar::handle:vertical {
             row2.addLayout(col, 1)
         settings_layout.addLayout(row2)
 
-        self.custom_section = QGroupBox("Custom Names")
+        self.custom_section = QGroupBox("Typed Name")
         custom_layout = QVBoxLayout(self.custom_section)
         custom_layout.setSpacing(6)
-        self.custom_names_edit = QPlainTextEdit()
-        self.custom_names_edit.setPlaceholderText("One name per line or comma-separated  (e.g. KEREM, BATSHEVA)")
-        self.custom_names_edit.setMaximumHeight(80)
+        custom_layout.addWidget(
+            self._label_with_help(
+                "Name",
+                "Custom and Single modes render one typed name only. If comma-separated text is pasted, only the first parsed entry is used.",
+            )
+        )
+        self.custom_names_edit = QLineEdit()
+        self.custom_names_edit.setPlaceholderText("Enter one name  (example: Kerem)")
+        self.custom_names_edit.textChanged.connect(self._refresh_single_save_ui)
         custom_layout.addWidget(self.custom_names_edit)
-        self.auto_open_custom_check = QCheckBox("Auto-open PNG after render")
+        self.custom_name_hint_label = QLabel(
+            "Custom saves locally. Single uses the same typed name flow and then imports the rendered PNGs to Supabase."
+        )
+        self.custom_name_hint_label.setObjectName("subtleMeta")
+        self.custom_name_hint_label.setWordWrap(True)
+        custom_layout.addWidget(self.custom_name_hint_label)
+        self.auto_open_custom_check = QCheckBox("Auto-open first PNG after render")
         self.auto_open_custom_check.setChecked(True)
         custom_layout.addWidget(self.auto_open_custom_check)
+
+        self.single_save_card = QFrame()
+        self.single_save_card.setObjectName("singleSaveCard")
+        single_save_layout = QVBoxLayout(self.single_save_card)
+        single_save_layout.setContentsMargins(12, 12, 12, 12)
+        single_save_layout.setSpacing(8)
+
+        single_save_title = QLabel("Save Single Name to Supabase")
+        single_save_layout.addWidget(single_save_title)
+
+        single_save_note = QLabel(
+            "Single mode renders the typed name, archives the selected color PNGs locally, and imports them into the shared Supabase cache. Existing cache keys are skipped."
+        )
+        single_save_note.setObjectName("subtleMeta")
+        single_save_note.setWordWrap(True)
+        single_save_layout.addWidget(single_save_note)
+
         save_row = QHBoxLayout()
         save_row.setSpacing(6)
-        self.save_single_supabase_check = QCheckBox("Save single render to Supabase")
+        self.save_single_supabase_check = QCheckBox("Supabase upload runs automatically in Single mode")
+        self.save_single_supabase_check.setEnabled(False)
         save_row.addWidget(self.save_single_supabase_check)
         save_row.addWidget(
             self._help_icon(
-                f"If enabled, custom-mode PNGs are archived under "
-                f"{default_single_supabase_export_dir()} and then imported into Supabase "
-                "using the shared PS-local cache schema."
+                f"The exported PNGs are archived under {default_single_supabase_export_dir()} "
+                f"and uploaded using config from {single_save_supabase_config_file()}."
             )
         )
         save_row.addStretch(1)
-        custom_layout.addWidget(self._wrap(save_row))
-        custom_layout.addWidget(
-            QLabel(f"Uses bundled config: {single_save_supabase_config_file()}")
-        )
+        single_save_layout.addWidget(self._wrap(save_row))
+
+        self.single_save_target_label = QLabel("")
+        self.single_save_target_label.setObjectName("subtleMeta")
+        self.single_save_target_label.setWordWrap(True)
+        single_save_layout.addWidget(self.single_save_target_label)
+
+        self.single_save_styles_label = QLabel("")
+        self.single_save_styles_label.setObjectName("subtleMeta")
+        self.single_save_styles_label.setWordWrap(True)
+        single_save_layout.addWidget(self.single_save_styles_label)
+
+        self.single_save_config_label = QLabel("")
+        self.single_save_config_label.setObjectName("subtleMeta")
+        self.single_save_config_label.setWordWrap(True)
+        self.single_save_config_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        single_save_layout.addWidget(self.single_save_config_label)
+
+        self.single_save_archive_label = QLabel("")
+        self.single_save_archive_label.setObjectName("subtleMeta")
+        self.single_save_archive_label.setWordWrap(True)
+        self.single_save_archive_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        single_save_layout.addWidget(self.single_save_archive_label)
+
+        single_save_btn_row = QHBoxLayout()
+        single_save_btn_row.setSpacing(8)
+        self.single_save_open_config_btn = QPushButton("Open Config")
+        self.single_save_open_config_btn.setObjectName("ghostBtn")
+        self.single_save_open_config_btn.clicked.connect(self._open_single_save_config_location)
+        self.single_save_open_archive_btn = QPushButton("Open Archive ↗")
+        self.single_save_open_archive_btn.setObjectName("ghostBtn")
+        self.single_save_open_archive_btn.clicked.connect(self._open_single_save_archive_dir)
+        single_save_btn_row.addWidget(self.single_save_open_config_btn)
+        single_save_btn_row.addWidget(self.single_save_open_archive_btn)
+        single_save_btn_row.addStretch(1)
+        single_save_layout.addWidget(self._wrap(single_save_btn_row))
+
+        self.single_save_status_label = QLabel("")
+        self.single_save_status_label.setWordWrap(True)
+        self.single_save_status_label.setVisible(False)
+        single_save_layout.addWidget(self.single_save_status_label)
+
+        self.single_save_result_label = QLabel("")
+        self.single_save_result_label.setWordWrap(True)
+        self.single_save_result_label.setVisible(False)
+        single_save_layout.addWidget(self.single_save_result_label)
+
+        custom_layout.addWidget(self.single_save_card)
         settings_layout.addWidget(self.custom_section)
 
         self.letter_section = QGroupBox("Letter Coverage")
@@ -878,6 +1124,22 @@ QScrollBar::handle:vertical {
         w.setLayout(layout)
         return w
 
+    @staticmethod
+    def _set_box_kind(widget: QLabel, kind: str) -> None:
+        object_name = {
+            "info": "infoBox",
+            "success": "successBox",
+            "warning": "warningBox",
+            "error": "errorBox",
+        }.get(kind, "infoBox")
+        if widget.objectName() == object_name:
+            return
+        widget.setObjectName(object_name)
+        style = widget.style()
+        style.unpolish(widget)
+        style.polish(widget)
+        widget.update()
+
     def _help_icon(self, text: str) -> QToolButton:
         btn = QToolButton()
         btn.setObjectName("helpIconBtn")
@@ -899,8 +1161,16 @@ QScrollBar::handle:vertical {
         mode = str(self.mode_combo.currentData())
         self.letters_edit.setEnabled(mode == "full")
         self.letter_section.setVisible(mode == "full")
-        self.custom_names_edit.setEnabled(mode == "custom")
-        self.custom_section.setVisible(mode == "custom")
+        is_typed_name_mode = mode in {"custom", "single"}
+        is_single_supabase_mode = mode == "single"
+        self.custom_names_edit.setEnabled(is_typed_name_mode)
+        self.custom_section.setVisible(is_typed_name_mode)
+        self.single_save_card.setVisible(is_single_supabase_mode)
+        self.save_single_supabase_check.blockSignals(True)
+        self.save_single_supabase_check.setChecked(is_single_supabase_mode)
+        self.save_single_supabase_check.blockSignals(False)
+        self._update_names_file_warning()
+        self._refresh_single_save_ui()
 
     def _render_letter_filters(self) -> None:
         while self.letter_layout.count():
@@ -1177,12 +1447,14 @@ QScrollBar::handle:vertical {
             return
         self._apply_letters_to_checks(text)
         self.refresh_letter_summary()
+        self._update_names_file_warning()
 
     def _on_letter_checks_changed(self) -> None:
         if self._syncing_letters:
             return
         self._sync_letters_text_from_checks()
         self._update_letter_badge()
+        self._update_names_file_warning()
 
     def selected_letters(self) -> list[str]:
         return [letter for letter, cb in self.letter_checks.items() if cb.isChecked()]
@@ -1378,6 +1650,92 @@ QScrollBar::handle:vertical {
     def _on_names_file_changed(self) -> None:
         load_names_by_letter.cache_clear()
         self.refresh_letter_summary()
+        self._update_names_file_warning()
+
+    def _selected_full_mode_names(self) -> list[str]:
+        names_file = self.selected_names_file()
+        if not names_file.exists():
+            return []
+        try:
+            rows = load_text_names(names_file)
+        except OSError:
+            return []
+        letters = set(self.selected_letters())
+        if not letters or len(letters) == len(ALPHABET):
+            return rows
+        return [name for name in rows if name and name[0].upper() in letters]
+
+    def _names_batch_warning_info(self) -> dict[str, object] | None:
+        if str(self.mode_combo.currentData()) != "full":
+            return None
+        psd_text = self.psd_edit.text().strip() or str(DEFAULT_PSD)
+        psd_signature = normalize_psd_signature(psd_text)
+        if not psd_signature:
+            return None
+        selected_names = self._selected_full_mode_names()
+        selected_keys = {
+            normalize_name_match_key(name)
+            for name in selected_names
+            if normalize_name_match_key(name)
+        }
+        if not selected_keys:
+            return None
+
+        matches: list[tuple[ProcessedBatchReference, int]] = []
+        covered_keys: set[str] = set()
+        for batch in processed_batch_references():
+            if batch.psd_signature != psd_signature:
+                continue
+            overlap = selected_keys & batch.selected_keys
+            if not overlap:
+                continue
+            covered_keys.update(overlap)
+            matches.append((batch, len(overlap)))
+
+        if not matches:
+            return None
+
+        total = len(selected_keys)
+        covered = len(covered_keys)
+        matches.sort(key=lambda item: (-item[1], item[0].output_dir.name.casefold()))
+        full_cover = covered >= total
+        lines = [
+            f"{batch.output_dir.name}: {count}/{total} names"
+            for batch, count in matches[:3]
+        ]
+        if len(matches) > 3:
+            lines.append(f"+ {len(matches) - 3} more same-PSD batch reference(s)")
+
+        if full_cover:
+            title = f"Warning: this list is already fully covered by same-PSD processed batches ({covered}/{total})."
+        else:
+            title = f"Warning: this list overlaps same-PSD processed batches ({covered}/{total})."
+
+        label_text = title + "\n" + "\n".join(f"- {line}" for line in lines)
+        dialog_text = (
+            title
+            + "\n\n"
+            + "\n".join(f"- {line}" for line in lines)
+            + "\n\nContinue anyway?"
+        )
+        return {
+            "label": label_text,
+            "dialog": dialog_text,
+            "confirm": True,
+        }
+
+    def _update_names_file_warning(self) -> None:
+        info = self._names_batch_warning_info()
+        if not info:
+            self._names_warning_confirm_required = False
+            self._names_warning_dialog_text = ""
+            self.names_warning_label.clear()
+            self.names_warning_label.setVisible(False)
+            return
+        self._names_warning_confirm_required = bool(info.get("confirm", False))
+        self._names_warning_dialog_text = str(info.get("dialog", "")).strip()
+        self.names_warning_label.setText(str(info.get("label", "")).strip())
+        self.names_warning_label.setVisible(True)
 
     def cleanup_scratch_temp_files(self) -> None:
         self.scratch_cleanup_btn.setEnabled(False)
@@ -1408,11 +1766,13 @@ QScrollBar::handle:vertical {
         self.psd_badge.setText(name)
         self.psd_badge.setToolTip(text)
         self.refresh_scratch_status()
+        self._update_names_file_warning()
 
     def _update_style_badge(self) -> None:
         selected = sum(1 for cb in self.style_checks.values() if cb.isChecked())
         total = len(self.style_checks)
         self.style_badge.setText(f"{selected} of {total} selected")
+        self._refresh_single_save_ui()
 
     def _open_output_folder(self) -> None:
         path = Path(self.out_edit.text().strip() or str(DEFAULT_OUTPUT))
@@ -1457,6 +1817,109 @@ QScrollBar::handle:vertical {
         self.log.moveCursor(QTextCursor.End)
         self.log.insertPlainText(text)
         self.log.ensureCursorVisible()
+
+    def _parsed_custom_names(self) -> list[str]:
+        return self._parse_custom_names(self.custom_names_edit.text().strip())
+
+    def _set_single_save_status(self, text: str, kind: str) -> None:
+        self._set_box_kind(self.single_save_status_label, kind)
+        self.single_save_status_label.setText(text.strip())
+        self.single_save_status_label.setVisible(bool(text.strip()))
+
+    def _set_single_save_result(self, text: str, kind: str, *, visible: bool = True) -> None:
+        self._set_box_kind(self.single_save_result_label, kind)
+        self.single_save_result_label.setText(text.strip())
+        self.single_save_result_label.setVisible(visible and bool(text.strip()))
+
+    def _open_single_save_config_location(self) -> None:
+        path = single_save_supabase_config_file()
+        if path.exists():
+            self._open_path(path)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._open_path(path.parent)
+        QMessageBox.information(
+            self,
+            "Single-Save Config",
+            f"Config file not found yet.\n\nCreate or copy it here:\n{path}",
+        )
+
+    def _open_single_save_archive_dir(self) -> None:
+        archive_dir = default_single_supabase_export_dir()
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        self._open_path(archive_dir)
+
+    def _refresh_single_save_ui(self) -> None:
+        if not hasattr(self, "save_single_supabase_check"):
+            return
+        mode = str(self.mode_combo.currentData()) if hasattr(self, "mode_combo") else "full"
+        parsed = self._parsed_custom_names()
+        target_name = parsed[0] if parsed else ""
+        extra_count = max(0, len(parsed) - 1)
+        selected_styles = self.selected_styles() if hasattr(self, "style_checks") else []
+        archive_dir = default_single_supabase_export_dir()
+        config_path = single_save_supabase_config_file()
+
+        self.single_save_target_label.setText(
+            f"Target name: {target_name or 'enter one custom name'}"
+        )
+        if extra_count:
+            self.single_save_target_label.setText(
+                f"Target name: {target_name}  |  ignoring {extra_count} extra entr"
+                f"{'y' if extra_count == 1 else 'ies'}"
+            )
+        self.single_save_styles_label.setText(
+            f"Selected colors: {len(selected_styles)}  ({', '.join(selected_styles) if selected_styles else 'none selected'})"
+        )
+        self.single_save_archive_label.setText(f"Archive folder: {archive_dir}")
+
+        config_error = ""
+        config_meta = ""
+        try:
+            config = load_single_save_config()
+            config_meta = (
+                f"Config ready: bucket {config.storage_bucket}  |  table {config.cache_table}  |  "
+                f"folder {config.storage_folder}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            config_error = str(exc)
+
+        self.single_save_config_label.setText(
+            f"Config file: {config_path}\n{config_meta or f'Config issue: {config_error}'}"
+        )
+
+        if mode != "single":
+            self._set_single_save_status(
+                "Single mode archives the rendered PNGs locally and then imports them into Supabase.",
+                "info",
+            )
+            return
+
+        if not target_name:
+            self._set_single_save_status(
+                "Enter one typed name first. Single mode renders and uploads only one name per run.",
+                "warning",
+            )
+            return
+        if not selected_styles:
+            self._set_single_save_status(
+                "Select at least one color style. The single-save upload uses the rendered PNGs from the currently selected styles.",
+                "warning",
+            )
+            return
+        if config_error:
+            self._set_single_save_status(
+                f"Upload is enabled but the Supabase config is not ready: {config_error}",
+                "error",
+            )
+            return
+
+        ready_text = (
+            f"Ready. After render, {len(selected_styles)} PNG"
+            f"{'' if len(selected_styles) == 1 else 's'} for {target_name} will be copied to {archive_dir} "
+            "and imported into Supabase. Existing cache keys will be skipped."
+        )
+        self._set_single_save_status(ready_text, "success")
 
     @staticmethod
     def _parse_custom_names(raw: str) -> list[str]:
@@ -1578,19 +2041,24 @@ QScrollBar::handle:vertical {
                 "chunk_size": chunk_size,
                 "restart_every_chunks": restart_every_chunks,
             }
-        elif mode == "custom":
-            raw = self.custom_names_edit.toPlainText().strip()
+        elif mode in {"custom", "single"}:
+            raw = self.custom_names_edit.text().strip()
             if not raw:
-                raise ValueError("Custom mode selected but no custom names were provided.")
+                raise ValueError("Typed-name mode selected but no single name was provided.")
             parsed = self._parse_custom_names(raw)
             if not parsed:
-                raise ValueError("Custom names are empty. Enter at least one name.")
+                raise ValueError("Single name is empty. Enter one name.")
             selected_name = parsed[0]
-            if self.save_single_supabase_check.isChecked():
-                load_single_save_config()
+            save_single_supabase = mode == "single"
+            if save_single_supabase:
+                config = load_single_save_config()
+                self.append_log(
+                    f"[APP] Single-save armed for {selected_name}: "
+                    f"{len(styles)} style(s) -> {config.cache_table} via {config.storage_bucket}.\n"
+                )
             if len(parsed) > 1:
                 self.append_log(
-                    f"[APP] Custom mode uses only first name: {selected_name} "
+                    f"[APP] Typed-name modes use only first name: {selected_name} "
                     f"(ignored {len(parsed)-1} extra name(s)).\n"
                 )
             runner_args.extend(
@@ -1607,7 +2075,8 @@ QScrollBar::handle:vertical {
                 "mode": mode,
                 "styles": styles,
                 "custom_name": selected_name,
-                "save_single_supabase": self.save_single_supabase_check.isChecked(),
+                "custom_name_input": raw,
+                "save_single_supabase": save_single_supabase,
                 "names_file": str(names_file),
                 "chunk_size": chunk_size,
                 "restart_every_chunks": restart_every_chunks,
@@ -1637,6 +2106,20 @@ QScrollBar::handle:vertical {
         if not psd.exists():
             QMessageBox.critical(self, "Error", "Select a valid PSD path.")
             return
+        self._update_names_file_warning()
+        if str(self.mode_combo.currentData()) == "full" and self._names_warning_confirm_required:
+            reply = QMessageBox.warning(
+                self,
+                "Same PSD Batch Warning",
+                self._names_warning_dialog_text or "This list overlaps with same-PSD processed batches. Continue anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                self._set_status("start cancelled")
+                return
+        if str(self.mode_combo.currentData()) in {"custom", "single"}:
+            self._set_single_save_result("", "info", visible=False)
         try:
             cmd = self.build_cmd()
         except Exception as exc:  # noqa: BLE001
@@ -1845,22 +2328,28 @@ QScrollBar::handle:vertical {
         if bool(self.last_run_meta.get("post_run_handled", False)):
             return
         self.last_run_meta["post_run_handled"] = True
-        if str(self.last_run_meta.get("mode", "")) != "custom":
+        if str(self.last_run_meta.get("mode", "")) not in {"custom", "single"}:
             return
         self._handle_custom_post_run()
 
     def _handle_custom_post_run(self) -> None:
-        if str(self.last_run_meta.get("mode", "")) != "custom":
+        mode = str(self.last_run_meta.get("mode", ""))
+        if mode not in {"custom", "single"}:
             return
         self.current_output = self._current_output_path()
         render_name, outputs = self._custom_render_outputs()
         if not render_name or not outputs:
-            self.append_log("[APP] Custom run finished but no PNGs were found.\n")
+            self.append_log("[APP] Typed-name run finished but no PNGs were found.\n")
+            if bool(self.last_run_meta.get("save_single_supabase", False)):
+                self._set_single_save_result(
+                    "Render finished but no PNGs were found for the single-save upload.",
+                    "warning",
+                )
             return
         first_style, first_output = outputs[0]
         self.result_label.setText(f"Last Result: {render_name} ({first_style})")
         for style, out in outputs:
-            self.append_log(f"[APP] Custom result ready: {out} ({style})\n")
+            self.append_log(f"[APP] Typed-name result ready: {out} ({style})\n")
         if self.auto_open_custom_check.isChecked():
             self._open_path(first_output)
         if not bool(self.last_run_meta.get("save_single_supabase", False)):
@@ -1872,17 +2361,34 @@ QScrollBar::handle:vertical {
             if import_result.output:
                 for line in import_result.output.splitlines():
                     self.append_log(f"[SUPABASE] {line}\n")
+            uploaded_count = sum(1 for item in import_result.items if item.status == "uploaded")
+            skipped_count = sum(1 for item in import_result.items if item.status == "skipped")
+            failed_count = sum(1 for item in import_result.items if item.status == "failed")
             if import_result.ok:
                 self.append_log(
                     f"[APP] Supabase single-save completed for {render_name} "
                     f"({len(archived_run.archived_renders)} PNGs).\n"
                 )
+                summary_kind = "success" if uploaded_count else "info"
+                self._set_single_save_result(
+                    f"Supabase import finished for {render_name}. Uploaded {uploaded_count}, skipped {skipped_count}, failed {failed_count}. Archive: {archived_run.run_root}",
+                    summary_kind,
+                )
             else:
                 self.append_log(
-                    f"[APP] Supabase single-save failed with exit code {import_result.returncode}.\n"
+                    f"[APP] Supabase single-save had failures for {render_name}. "
+                    f"Uploaded {uploaded_count}, skipped {skipped_count}, failed {failed_count}.\n"
+                )
+                self._set_single_save_result(
+                    f"Supabase import had failures for {render_name}. Uploaded {uploaded_count}, skipped {skipped_count}, failed {failed_count}. Check the run log for per-style errors.",
+                    "error",
                 )
         except Exception as exc:  # noqa: BLE001
             self.append_log(f"[APP] Supabase single-save failed: {exc}\n")
+            self._set_single_save_result(
+                f"Supabase import failed: {exc}",
+                "error",
+            )
 
     def _save_settings(self) -> None:
         payload = {
@@ -1898,7 +2404,8 @@ QScrollBar::handle:vertical {
             "ps_exec": self.ps_exec_edit.text().strip(),
             "styles": self.selected_styles(),
             "skip_done_letters": self.skip_done_letters_check.isChecked(),
-            "custom_names": self.custom_names_edit.toPlainText(),
+            "custom_name": self.custom_names_edit.text().strip(),
+            "custom_names": self.custom_names_edit.text().strip(),
             "auto_open_custom": self.auto_open_custom_check.isChecked(),
             "save_single_supabase": self.save_single_supabase_check.isChecked(),
         }
@@ -1909,12 +2416,14 @@ QScrollBar::handle:vertical {
         if not SETTINGS_FILE.exists():
             self.psd_edit.setText(str(DEFAULT_PSD))
             self.out_edit.setText(str(DEFAULT_OUTPUT))
+            self._refresh_single_save_ui()
             return
         try:
             cfg = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, ValueError, TypeError):
             self.psd_edit.setText(str(DEFAULT_PSD))
             self.out_edit.setText(str(DEFAULT_OUTPUT))
+            self._refresh_single_save_ui()
             return
         self.psd_edit.setText(str(cfg.get("psd", str(DEFAULT_PSD))))
         self.out_edit.setText(str(cfg.get("output", str(DEFAULT_OUTPUT))))
@@ -1924,7 +2433,12 @@ QScrollBar::handle:vertical {
         idx = self.names_file_combo.findData(names_file)
         if idx >= 0:
             self.names_file_combo.setCurrentIndex(idx)
-        mode = str(cfg.get("mode", "full"))
+        saved_single_supabase = bool(cfg.get("save_single_supabase", False))
+        raw_mode = str(cfg.get("mode", "full"))
+        if raw_mode == "custom" and saved_single_supabase:
+            mode = "single"
+        else:
+            mode = normalize_saved_mode(raw_mode)
         idx = self.mode_combo.findData(mode)
         if idx >= 0:
             self.mode_combo.setCurrentIndex(idx)
@@ -1934,16 +2448,19 @@ QScrollBar::handle:vertical {
         self.timeout_spin.setValue(int(cfg.get("timeout", 300)))
         self.restart_spin.setValue(int(cfg.get("restart", 0)))
         self.ps_exec_edit.setText(str(cfg.get("ps_exec", "")))
-        self.custom_names_edit.setPlainText(str(cfg.get("custom_names", "")))
+        self.custom_names_edit.setText(str(cfg.get("custom_name", cfg.get("custom_names", ""))))
         self.auto_open_custom_check.setChecked(bool(cfg.get("auto_open_custom", True)))
-        self.save_single_supabase_check.setChecked(bool(cfg.get("save_single_supabase", False)))
+        self.save_single_supabase_check.setChecked(mode == "single")
         self.skip_done_letters_check.setChecked(bool(cfg.get("skip_done_letters", True)))
         saved_styles = cfg.get("styles", [])
         for name, cb in self.style_checks.items():
             cb.setChecked(name in saved_styles)
         self._update_style_badge()
+        self._set_single_save_result("", "info", visible=False)
+        self._refresh_single_save_ui()
         self.refresh_letter_summary()
         self.refresh_scratch_status()
+        self._update_names_file_warning()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._save_settings()
