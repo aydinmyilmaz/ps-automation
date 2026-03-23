@@ -108,6 +108,12 @@ def gmail_derived_dir() -> Path:
     return gmail_name_sync_root() / "04_derived"
 
 
+def popular_name_lists_dir() -> Path:
+    if is_frozen_app():
+        return resource_path("output", "gmail_name_sync", "08_popular_name_lists")
+    return gmail_name_sync_root() / "08_popular_name_lists"
+
+
 def curated_names_dir() -> Path:
     if not is_frozen_app():
         migrated = gmail_name_sync_root() / "05_curated"

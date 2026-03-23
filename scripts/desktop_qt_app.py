@@ -29,6 +29,7 @@ from app_paths import (
     gmail_derived_dir,
     gmail_ranked_dir,
     is_frozen_app,
+    popular_name_lists_dir,
     single_save_supabase_config_file,
 )
 from ps_single_renderer import STYLE_CHOICES, run_jsx, sanitize_filename
@@ -121,7 +122,7 @@ def available_names_files() -> list[tuple[str, Path]]:
     add("Gmail in 3000  all", derived_dir / "gmail_names_in_3000_unprocessed_all.txt")
     add("Gmail fallback  top 106", derived_dir / "gmail_names_not_in_3000_unprocessed_top_106.txt")
     add("Gmail fallback  all", derived_dir / "gmail_names_not_in_3000_unprocessed_all.txt")
-    popular_dir = PROJECT_ROOT / "output" / "gmail_name_sync" / "08_popular_name_lists"
+    popular_dir = popular_name_lists_dir()
     report_path = popular_dir / "popular_name_list_folder_report.json"
     if report_path.exists():
         try:

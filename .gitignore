@@ -13,7 +13,11 @@ __pycache__/
 !.github/workflows/**
 
 # Generated outputs (large, reproducible)
-output/
+output/*
+!output/gmail_name_sync/
+output/gmail_name_sync/*
+!output/gmail_name_sync/08_popular_name_lists/
+!output/gmail_name_sync/08_popular_name_lists/**
 
 # Large/local-only design assets and name datasets
 data/final_names

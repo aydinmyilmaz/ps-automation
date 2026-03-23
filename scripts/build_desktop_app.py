@@ -19,6 +19,7 @@ SPEC_DIR = PROJECT_ROOT / "build" / "spec"
 RELEASE_DIR = PROJECT_ROOT / "release"
 SINGLE_SAVE_CONFIG = PROJECT_ROOT / "config" / "supabase_single_save.json"
 CURATED_NAMES_DIR = PROJECT_ROOT / "output" / "gmail_name_sync" / "05_curated"
+POPULAR_NAME_LISTS_DIR = PROJECT_ROOT / "output" / "gmail_name_sync" / "08_popular_name_lists"
 SELECTED_PSD_DIR = PROJECT_ROOT / "data" / "selected-psd"
 
 
@@ -90,6 +91,12 @@ def build_pyinstaller(app_name: str) -> Path:
         "app_paths",
     ]
     add_optional_data(cmd, CURATED_NAMES_DIR, "data/final_names", "curated names")
+    add_optional_data(
+        cmd,
+        POPULAR_NAME_LISTS_DIR,
+        "output/gmail_name_sync/08_popular_name_lists",
+        "popular name lists",
+    )
     add_optional_data(cmd, SELECTED_PSD_DIR, "data/selected-psd", "selected PSD folder")
     if SINGLE_SAVE_CONFIG.exists():
         add_optional_data(cmd, SINGLE_SAVE_CONFIG, "config", "Supabase config")
