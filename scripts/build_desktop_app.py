@@ -18,6 +18,8 @@ WORK_DIR = PROJECT_ROOT / "build" / "pyinstaller"
 SPEC_DIR = PROJECT_ROOT / "build" / "spec"
 RELEASE_DIR = PROJECT_ROOT / "release"
 SINGLE_SAVE_CONFIG = PROJECT_ROOT / "config" / "supabase_single_save.json"
+CURATED_NAMES_DIR = PROJECT_ROOT / "output" / "gmail_name_sync" / "05_curated"
+SELECTED_PSD_DIR = PROJECT_ROOT / "data" / "selected-psd"
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +59,13 @@ def artifact_path(app_name: str) -> Path:
     return DIST_DIR / app_name
 
 
+def add_optional_data(cmd: list[str], source: Path, target: str, label: str) -> None:
+    if not source.exists():
+        print(f"Skipping missing {label}: {source}")
+        return
+    cmd.extend(["--add-data", pyinstaller_data_arg(source, target)])
+
+
 def build_pyinstaller(app_name: str) -> Path:
     cmd = [
         sys.executable,
@@ -79,18 +88,11 @@ def build_pyinstaller(app_name: str) -> Path:
         "onecall_unattended_batch",
         "--hidden-import",
         "app_paths",
-        "--add-data",
-        pyinstaller_data_arg(PROJECT_ROOT / "output" / "gmail_name_sync" / "05_curated", "data/final_names"),
-        "--add-data",
-        pyinstaller_data_arg(PROJECT_ROOT / "data" / "selected-psd", "data/selected-psd"),
     ]
+    add_optional_data(cmd, CURATED_NAMES_DIR, "data/final_names", "curated names")
+    add_optional_data(cmd, SELECTED_PSD_DIR, "data/selected-psd", "selected PSD folder")
     if SINGLE_SAVE_CONFIG.exists():
-        cmd.extend(
-            [
-                "--add-data",
-                pyinstaller_data_arg(SINGLE_SAVE_CONFIG, "config"),
-            ]
-        )
+        add_optional_data(cmd, SINGLE_SAVE_CONFIG, "config", "Supabase config")
     cmd.append(str(ENTRYPOINT))
     print("Running:", " ".join(cmd))
     subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=True)

@@ -1,0 +1,66 @@
+name: Build Windows Desktop App
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '.github/workflows/build-windows-desktop.yml'
+      - 'scripts/**'
+      - 'build/spec/**'
+      - 'requirements-desktop.txt'
+      - 'config/*.example.json'
+      - 'data/selected-psd/**'
+      - 'output/gmail_name_sync/05_curated/**'
+  pull_request:
+    paths:
+      - '.github/workflows/build-windows-desktop.yml'
+      - 'scripts/**'
+      - 'build/spec/**'
+      - 'requirements-desktop.txt'
+      - 'config/*.example.json'
+      - 'data/selected-psd/**'
+      - 'output/gmail_name_sync/05_curated/**'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install desktop dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements-desktop.txt
+
+      - name: Report bundled assets
+        shell: pwsh
+        run: |
+          if (Test-Path "data/selected-psd") {
+            Write-Host "Bundling PSD assets from data/selected-psd"
+          } else {
+            Write-Warning "data/selected-psd is missing; the app will require the user to browse to a PSD manually."
+          }
+          if (Test-Path "output/gmail_name_sync/05_curated") {
+            Write-Host "Bundling curated names from output/gmail_name_sync/05_curated"
+          } else {
+            Write-Warning "output/gmail_name_sync/05_curated is missing; the app will rely on user-provided names files."
+          }
+
+      - name: Build Windows desktop bundle
+        run: python scripts/build_desktop_app.py
+
+      - name: Upload Windows release zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: PSDBatchDesktop-windows
+          path: release/*.zip
+          if-no-files-found: error

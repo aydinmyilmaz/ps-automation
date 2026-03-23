@@ -5,6 +5,12 @@ __pycache__/
 *.pyd
 *.png
 *env*
+.github/*
+!.github/REPO_STRUCTURE.md
+!.github/skills/
+!.github/skills/**
+!.github/workflows/
+!.github/workflows/**
 
 # Generated outputs (large, reproducible)
 output/
