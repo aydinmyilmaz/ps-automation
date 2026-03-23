@@ -73,9 +73,9 @@ SETTINGS_FILE = desktop_settings_file()
 DEFAULT_PSD = bundled_default_psd()
 AUTO_RESTART_EVERY_CHUNKS = 4
 AUTO_FULL_CHUNK_SIZE = 3
-LOW_SCRATCH_SAFE_MODE_GB = 12.0
-LOW_SCRATCH_CHUNK_SIZE = 1
-LOW_SCRATCH_RESTART_EVERY_CHUNKS = 1
+LOW_SCRATCH_SAFE_MODE_GB = 10.0
+LOW_SCRATCH_CHUNK_SIZE = 2
+LOW_SCRATCH_RESTART_EVERY_CHUNKS = 2
 
 STYLE_COLORS: dict[str, str] = {
     "Yellow":      "#FDE047",
@@ -847,7 +847,7 @@ QScrollBar::handle:vertical {
             if attr == "chunk_spin":
                 help_text = "How many render jobs go into one Photoshop batch call. Smaller values are safer; larger values can be faster."
             elif attr == "retry_spin":
-                help_text = "How many times a failed chunk can be retried before the run stops."
+                help_text = "How many times a failed chunk can be retried after the first failure before the run stops."
             elif attr == "timeout_spin":
                 help_text = "Maximum seconds to wait for one chunk before it is treated as failed."
             elif attr == "restart_spin":

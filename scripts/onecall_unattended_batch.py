@@ -68,7 +68,7 @@ RETRYABLE_MARKERS = (
 
 MIN_FREE_DISK_GB_DEFAULT = 7.0
 SCRATCH_RECOVERY_BUFFER_GB = 1.0
-PERIODIC_RESTART_HEADROOM_BUFFER_GB = 8.0
+PERIODIC_RESTART_HEADROOM_BUFFER_GB = 3.0
 MAX_PERIODIC_RESTART_DEFER_MULTIPLIER = 4
 PHOTOSHOP_TEMP_PATTERNS = (
     "Photoshop Temp*",
@@ -81,6 +81,13 @@ class Job:
     style: str
     text: str
     output_path: Path
+
+
+@dataclass(frozen=True)
+class ScratchRecoveryResult:
+    path: Path | None
+    free_gb: float | None
+    photoshop_restarted: bool = False
 
 
 class RecoverableScratchHeadroomError(RuntimeError):
@@ -135,7 +142,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=10,
         help="Jobs per single JSX call. Start small for stability, then increase.",
     )
-    parser.add_argument("--max-retries", type=int, default=3, help="Retries per chunk on recoverable failures.")
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=3,
+        help="Recoverable retries per chunk after the first failed attempt.",
+    )
     parser.add_argument(
         "--output-root",
         type=Path,
@@ -378,12 +390,12 @@ def recover_scratch_headroom(
     photoshop_exec: Path | None,
     min_free_disk_gb: float,
     reason: str,
-) -> tuple[Path | None, float | None]:
+) -> ScratchRecoveryResult:
     lowest_path, lowest_free_gb = lowest_scratch_headroom(output_root, psd_path)
     if lowest_free_gb is None:
-        return lowest_path, lowest_free_gb
+        return ScratchRecoveryResult(path=lowest_path, free_gb=lowest_free_gb)
     if lowest_free_gb >= min_free_disk_gb:
-        return lowest_path, lowest_free_gb
+        return ScratchRecoveryResult(path=lowest_path, free_gb=lowest_free_gb)
 
     print(
         f"[WARN] Scratch headroom low after {reason}: "
@@ -403,7 +415,7 @@ def recover_scratch_headroom(
             f"[INFO] Cleanup alone recovered scratch to {lowest_free_gb:.2f} GiB "
             f"on {lowest_path} — Photoshop restart not needed."
         )
-        return lowest_path, lowest_free_gb
+        return ScratchRecoveryResult(path=lowest_path, free_gb=lowest_free_gb)
 
     print(
         f"[INFO] Still only {lowest_free_gb:.2f} GiB free after cleanup — restarting Photoshop "
@@ -419,7 +431,7 @@ def recover_scratch_headroom(
         )
     lowest_path, lowest_free_gb = lowest_scratch_headroom(output_root, psd_path)
     if lowest_free_gb is None:
-        return lowest_path, lowest_free_gb
+        return ScratchRecoveryResult(path=lowest_path, free_gb=lowest_free_gb, photoshop_restarted=True)
 
     hard_stop_threshold = 2.0
     if lowest_free_gb < hard_stop_threshold:
@@ -435,7 +447,7 @@ def recover_scratch_headroom(
         )
     else:
         print(f"[INFO] Scratch headroom recovered to {lowest_free_gb:.2f} GiB on {lowest_path}.")
-    return lowest_path, lowest_free_gb
+    return ScratchRecoveryResult(path=lowest_path, free_gb=lowest_free_gb, photoshop_restarted=True)
 
 
 def cleanup_photoshop_temp_files() -> tuple[int, int]:
@@ -880,8 +892,9 @@ def render_chunk_with_retries(
     output_root: Path,
     min_free_disk_gb: float,
     photoshop_exec: Path | None,
-) -> tuple[int, float]:
+) -> tuple[int, float, bool]:
     attempt = 0
+    restarted_photoshop = False
     chunk_start = time.perf_counter()
     pending = [j for j in chunk if not j.output_path.exists()]
     while pending:
@@ -893,19 +906,25 @@ def render_chunk_with_retries(
             if not result.startswith("OK|"):
                 raise RuntimeError(result)
         except Exception as exc:  # noqa: BLE001
-            if attempt >= max_retries or not is_retryable_error(exc):
+            retries_used = attempt - 1
+            if retries_used >= max_retries or not is_retryable_error(exc):
                 raise
-            print(f"[WARN] Chunk retry {attempt}/{max_retries} after recoverable error: {exc}")
+            print(f"[WARN] Chunk retry {retries_used + 1}/{max_retries} after recoverable error: {exc}")
             if "scratch disks are full" in str(exc).lower():
-                recover_scratch_headroom(
+                recovery = recover_scratch_headroom(
                     output_root=output_root,
                     psd_path=psd_path,
                     photoshop_exec=photoshop_exec,
                     min_free_disk_gb=min_free_disk_gb,
                     reason="scratch-full error",
                 )
+                restarted_photoshop = restarted_photoshop or recovery.photoshop_restarted
+                if not recovery.photoshop_restarted:
+                    restart_photoshop(photoshop_exec)
+                    restarted_photoshop = True
             else:
                 restart_photoshop(photoshop_exec)
+                restarted_photoshop = True
             pending = [j for j in pending if not j.output_path.exists()]
             continue
 
@@ -913,13 +932,20 @@ def render_chunk_with_retries(
             if produced_job.output_path.exists():
                 crop_png_to_alpha_bounds(produced_job.output_path)
         pending = [j for j in pending if not j.output_path.exists()]
-        if pending and attempt < max_retries:
-            print(f"[WARN] Chunk produced partial output; retrying remaining {len(pending)} job(s).")
+        if pending:
+            retries_used = attempt - 1
+            if retries_used >= max_retries:
+                raise RuntimeError(f"Chunk produced partial output; {len(pending)} job(s) still missing after retries.")
+            print(
+                f"[WARN] Chunk produced partial output; retrying remaining {len(pending)} job(s) "
+                f"({retries_used + 1}/{max_retries})."
+            )
             restart_photoshop(photoshop_exec)
+            restarted_photoshop = True
 
     produced = sum(1 for j in chunk if j.output_path.exists())
     elapsed = time.perf_counter() - chunk_start
-    return produced, elapsed
+    return produced, elapsed, restarted_photoshop
 
 
 def run_once(args: argparse.Namespace, kill_first: bool) -> tuple[int, int]:
@@ -928,8 +954,8 @@ def run_once(args: argparse.Namespace, kill_first: bool) -> tuple[int, int]:
         raise FileNotFoundError(f"PSD not found: {psd_path}")
     if args.chunk_size <= 0:
         raise ValueError("--chunk-size must be > 0")
-    if args.max_retries <= 0:
-        raise ValueError("--max-retries must be > 0")
+    if args.max_retries < 0:
+        raise ValueError("--max-retries must be >= 0")
     if args.chunk_timeout <= 0:
         raise ValueError("--chunk-timeout must be > 0")
     if args.restart_every_chunks < 0:
@@ -1017,7 +1043,7 @@ def run_once(args: argparse.Namespace, kill_first: bool) -> tuple[int, int]:
     start = time.perf_counter()
     deferred_periodic_restarts = 0
     for idx, chunk in enumerate(chunks, start=1):
-        produced, elapsed = render_chunk_with_retries(
+        produced, elapsed, restarted_this_chunk = render_chunk_with_retries(
             chunk,
             args.max_retries,
             args.chunk_timeout,
@@ -1064,13 +1090,15 @@ def run_once(args: argparse.Namespace, kill_first: bool) -> tuple[int, int]:
         lowest_path, lowest_free_gb = lowest_scratch_headroom(output_root, psd_path)
         proactive_recovery_floor = args.min_free_disk_gb + SCRATCH_RECOVERY_BUFFER_GB
         if lowest_free_gb is not None and lowest_free_gb < proactive_recovery_floor:
-            recover_scratch_headroom(
+            recovery = recover_scratch_headroom(
                 output_root=output_root,
                 psd_path=psd_path,
                 photoshop_exec=photoshop_exec,
                 min_free_disk_gb=args.min_free_disk_gb,
                 reason=f"chunk {idx} (proactive floor {proactive_recovery_floor:.1f} GiB)",
             )
+            restarted_this_chunk = restarted_this_chunk or recovery.photoshop_restarted
+            lowest_path, lowest_free_gb = recovery.path, recovery.free_gb
 
         if args.restart_every_chunks > 0 and idx < len(chunks) and (idx % args.restart_every_chunks == 0):
             lowest_path, lowest_free_gb = lowest_scratch_headroom(output_root, psd_path)
@@ -1080,7 +1108,12 @@ def run_once(args: argparse.Namespace, kill_first: bool) -> tuple[int, int]:
                 or lowest_free_gb <= periodic_restart_floor
                 or deferred_periodic_restarts >= (MAX_PERIODIC_RESTART_DEFER_MULTIPLIER - 1)
             )
-            if periodic_restart_due:
+            if restarted_this_chunk:
+                deferred_periodic_restarts = 0
+                print(
+                    f"[INFO] Skipping periodic restart at chunk {idx}; Photoshop was already restarted during chunk recovery."
+                )
+            elif periodic_restart_due:
                 print(
                     f"[INFO] Periodic Photoshop restart after chunk {idx} "
                     f"(free={lowest_free_gb:.2f} GiB on {lowest_path})."
