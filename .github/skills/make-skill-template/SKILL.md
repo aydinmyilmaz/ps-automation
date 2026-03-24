@@ -8,7 +8,7 @@ argument-hint: [skill purpose] [scope] [scripts/references]
 
 Create skills in this repo under `.github/skills/<skill-name>/`.
 
-Read [references/links.md](/Users/aydin/Desktop/apps/ps-automation/.github/skills/make-skill-template/references/links.md) if you need the official GitHub or VS Code skill conventions while authoring.
+Read [references/links.md](references/links.md) if you need the official GitHub or VS Code skill conventions while authoring.
 
 ## Workflow
 

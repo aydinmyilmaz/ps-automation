@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 import json
 import os
@@ -19,15 +20,15 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import onecall_unattended_batch as batch_runner
+import render_request_worker as request_worker_runner
 from app_paths import (
     SOURCE_PROJECT_ROOT,
     bundled_default_psd,
     bundled_names_file,
     default_batch_output_dir,
+    default_request_worker_dir,
     default_single_supabase_export_dir,
     desktop_settings_file,
-    gmail_derived_dir,
-    gmail_ranked_dir,
     is_frozen_app,
     popular_name_lists_dir,
     single_save_supabase_config_file,
@@ -68,8 +69,10 @@ except Exception as exc:  # noqa: BLE001
 
 PROJECT_ROOT = SOURCE_PROJECT_ROOT
 WORKER_FLAG = "--run-batch-worker"
+REQUEST_WORKER_FLAG = "--run-request-worker"
 NAMES_FILE = bundled_names_file()
 DEFAULT_OUTPUT = default_batch_output_dir()
+REQUEST_WORKER_DIR = default_request_worker_dir()
 SETTINGS_FILE = desktop_settings_file()
 DEFAULT_PSD = bundled_default_psd()
 AUTO_RESTART_EVERY_CHUNKS = 4
@@ -112,16 +115,6 @@ def available_names_files() -> list[tuple[str, Path]]:
         items.append((label, resolved))
 
     add("3000 curated names", bundled_names_file())
-    gmail_dir = gmail_ranked_dir()
-    derived_dir = gmail_derived_dir()
-    add("Gmail first names  top 500", gmail_dir / "gmail_first_names_top_500.txt")
-    add("Gmail first names  top 1000", gmail_dir / "gmail_first_names_top_1000.txt")
-    add("Gmail first names  all 1624", gmail_dir / "gmail_first_names_top_1624.txt")
-    add("Batch fill  top 500", derived_dir / "gmail_names_next_batch_fill_after_3000_top_500.txt")
-    add("Gmail in 3000  500_1000", derived_dir / "gmail_names_in_3000_unprocessed_500_1000.txt")
-    add("Gmail in 3000  all", derived_dir / "gmail_names_in_3000_unprocessed_all.txt")
-    add("Gmail fallback  top 106", derived_dir / "gmail_names_not_in_3000_unprocessed_top_106.txt")
-    add("Gmail fallback  all", derived_dir / "gmail_names_not_in_3000_unprocessed_all.txt")
     popular_dir = popular_name_lists_dir()
     report_path = popular_dir / "popular_name_list_folder_report.json"
     if report_path.exists():
@@ -159,14 +152,12 @@ def available_names_files() -> list[tuple[str, Path]]:
 def normalize_saved_mode(mode: str) -> str:
     value = mode.strip()
     if value.startswith("test20_"):
-        try:
-            count = int(value.split("_", 1)[1])
-        except (TypeError, ValueError):
-            return "test20_1"
-        if count in {1, 5, 10, 20, 50}:
-            return value
-        return "test20_1"
-    return value or "full"
+        return "test20_5"
+    if value == "single":
+        return "custom"
+    if value in {"full", "custom"}:
+        return value
+    return "full"
 
 
 @dataclass(frozen=True)
@@ -296,10 +287,20 @@ def is_worker_mode(argv: list[str]) -> bool:
     return len(argv) > 1 and argv[1] == WORKER_FLAG
 
 
+def is_request_worker_mode(argv: list[str]) -> bool:
+    return len(argv) > 1 and argv[1] == REQUEST_WORKER_FLAG
+
+
 def build_worker_command(args: list[str]) -> list[str]:
     if is_frozen_app():
         return [sys.executable, WORKER_FLAG, *args]
     return [sys.executable, "-u", str(Path(__file__).resolve()), WORKER_FLAG, *args]
+
+
+def build_request_worker_command(args: list[str]) -> list[str]:
+    if is_frozen_app():
+        return [sys.executable, REQUEST_WORKER_FLAG, *args]
+    return [sys.executable, "-u", str(Path(__file__).resolve()), REQUEST_WORKER_FLAG, *args]
 
 
 def tail_text(path: Path, max_bytes: int = 30000) -> str:
@@ -309,6 +310,44 @@ def tail_text(path: Path, max_bytes: int = 30000) -> str:
     if len(raw) > max_bytes:
         raw = raw[-max_bytes:]
     return raw.decode("utf-8", errors="replace")
+
+
+def format_local_timestamp(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    return dt.astimezone().strftime("%d %b %Y %H:%M:%S")
+
+
+def format_project_relative_path(value: Path | str) -> str:
+    path_obj = Path(value).expanduser()
+    try:
+        resolved = path_obj.resolve()
+    except OSError:
+        resolved = path_obj
+    try:
+        return resolved.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def resolve_project_path(value: Path | str, *, default: Path | None = None) -> Path:
+    raw = str(value).strip()
+    if not raw:
+        target = default if default is not None else PROJECT_ROOT
+        return Path(target).expanduser().resolve()
+    path_obj = Path(raw).expanduser()
+    if not path_obj.is_absolute():
+        path_obj = PROJECT_ROOT / path_obj
+    return path_obj.resolve()
+
+
+def format_preferred_path(value: Path | str) -> str:
+    return format_project_relative_path(resolve_project_path(value))
 
 
 def inspect_psd_styles(psd_path: Path, timeout_seconds: int = 240) -> list[str]:
@@ -382,11 +421,12 @@ try {{
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("PSD Batch Desktop App")
+        self.setWindowTitle("Photoshop Render Studio")
         self.resize(1220, 860)
 
         self.proc: QProcess | None = None
         self.worker_pid: int | None = None
+        self.request_worker_pid: int | None = None
         self.current_output = DEFAULT_OUTPUT
         self.style_checks: dict[str, QCheckBox] = {}
         self.letter_checks: dict[str, QCheckBox] = {}
@@ -411,6 +451,7 @@ class MainWindow(QMainWindow):
         self.timer.setInterval(2500)
         self.timer.timeout.connect(self.refresh_status)
         self.timer.start()
+        QTimer.singleShot(0, self._restore_request_worker_state)
 
     def _apply_theme(self) -> None:
         self.setStyleSheet("""
@@ -430,6 +471,19 @@ QLabel#appTitle {
   font-weight: 700;
   color: #f9fafb;
   letter-spacing: -0.3px;
+}
+QLabel#appLogo {
+  min-width: 30px;
+  max-width: 30px;
+  min-height: 30px;
+  max-height: 30px;
+  border-radius: 9px;
+  background: #a855f7;
+  color: #ffffff;
+  border: 1px solid #c084fc;
+  font-size: 12px;
+  font-weight: 800;
+  qproperty-alignment: AlignCenter;
 }
 QLabel#psdBadge {
   background: #1f2937;
@@ -455,6 +509,62 @@ QGroupBox::title {
   padding: 0 4px;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+QGroupBox#setupCard {
+  background: #f8fbff;
+  border: 1px solid #dbeafe;
+  border-radius: 14px;
+  padding: 12px 14px 14px 14px;
+}
+QGroupBox#setupCard::title {
+  color: #315a94;
+  font-size: 15px;
+  font-weight: 700;
+  text-transform: none;
+  letter-spacing: 0.1px;
+}
+QGroupBox#renderCard {
+  background: #fcfbff;
+  border: 1px solid #e9d5ff;
+  border-radius: 14px;
+  padding: 12px 14px 14px 14px;
+}
+QGroupBox#renderCard::title {
+  color: #7c3aed;
+  font-size: 15px;
+  font-weight: 700;
+  text-transform: none;
+  letter-spacing: 0.1px;
+}
+QGroupBox#setupSubCard,
+QGroupBox#renderSubCard {
+  background: rgba(255, 255, 255, 0.75);
+  border-radius: 12px;
+  padding: 10px 12px 12px 12px;
+}
+QGroupBox#setupSubCard {
+  border: 1px solid #dbeafe;
+}
+QGroupBox#renderSubCard {
+  border: 1px solid #eadcff;
+}
+QGroupBox#setupSubCard::title,
+QGroupBox#renderSubCard::title {
+  text-transform: none;
+  letter-spacing: 0.1px;
+  font-size: 13px;
+  font-weight: 700;
+}
+QGroupBox#setupSubCard::title {
+  color: #5b7aa5;
+}
+QGroupBox#renderSubCard::title {
+  color: #8b5cf6;
+}
+QLabel#fieldLabel {
+  color: #1f2937;
+  font-size: 13px;
+  font-weight: 600;
 }
 QLineEdit, QComboBox, QSpinBox, QPlainTextEdit, QTextEdit {
   background: #ffffff;
@@ -491,24 +601,30 @@ QPushButton#primaryBtn {
   color: #ffffff;
   font-size: 14px;
   font-weight: 700;
+  border-radius: 11px;
+  padding: 11px 18px;
 }
 QPushButton#primaryBtn:hover  { background: #1d4ed8; }
 QPushButton#primaryBtn:pressed { background: #1e40af; }
 QPushButton#primaryBtn:disabled {
   background: #93c5fd;
   border-color: #93c5fd;
+  color: #eff6ff;
 }
 QPushButton#dangerBtn {
   background: #ef4444;
   border-color: #dc2626;
   color: #ffffff;
   font-weight: 700;
+  border-radius: 11px;
+  padding: 11px 18px;
 }
 QPushButton#dangerBtn:hover  { background: #dc2626; }
 QPushButton#dangerBtn:pressed { background: #b91c1c; }
 QPushButton#dangerBtn:disabled {
   background: #fca5a5;
   border-color: #fca5a5;
+  color: #fff1f2;
 }
 QPushButton#ghostBtn {
   background: transparent;
@@ -516,6 +632,27 @@ QPushButton#ghostBtn {
   color: #374151;
 }
 QPushButton#ghostBtn:hover { background: #f1f5f9; }
+QPushButton#softBtn {
+  background: #ffffff;
+  border: 1.5px solid #dbeafe;
+  border-radius: 10px;
+  padding: 8px 14px;
+  color: #1e3a8a;
+  font-weight: 700;
+}
+QPushButton#softBtn:hover {
+  background: #eff6ff;
+  border-color: #93c5fd;
+}
+QPushButton#softBtn:pressed {
+  background: #dbeafe;
+  border-color: #60a5fa;
+}
+QPushButton#softBtn:disabled {
+  background: #f8fafc;
+  border-color: #e2e8f0;
+  color: #94a3b8;
+}
 QProgressBar {
   border: 1.5px solid #e2e8f0;
   border-radius: 7px;
@@ -617,6 +754,53 @@ QToolButton#helpIconBtn:hover {
   background: #dbeafe;
   border-color: #93c5fd;
 }
+QToolButton#sectionToggleBtn {
+  background: #ffffff;
+  border: 1.5px solid #dbeafe;
+  border-radius: 12px;
+  padding: 10px 14px;
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 700;
+  text-align: left;
+}
+QToolButton#sectionToggleBtn:hover {
+  background: #eff6ff;
+  border-color: #93c5fd;
+}
+QToolButton#sectionToggleBtn:checked {
+  background: #eff6ff;
+  border-color: #60a5fa;
+  color: #1d4ed8;
+}
+QToolButton#sectionToggleBtn[sectionTone="orders"] {
+  background: #eff6ff;
+  border-color: #93c5fd;
+  color: #1d4ed8;
+}
+QToolButton#sectionToggleBtn[sectionTone="orders"]:hover {
+  background: #dbeafe;
+  border-color: #60a5fa;
+}
+QToolButton#sectionToggleBtn[sectionTone="orders"]:checked {
+  background: #dbeafe;
+  border-color: #2563eb;
+  color: #1d4ed8;
+}
+QToolButton#sectionToggleBtn[sectionTone="local"] {
+  background: #faf5ff;
+  border-color: #d8b4fe;
+  color: #7c3aed;
+}
+QToolButton#sectionToggleBtn[sectionTone="local"]:hover {
+  background: #f3e8ff;
+  border-color: #c084fc;
+}
+QToolButton#sectionToggleBtn[sectionTone="local"]:checked {
+  background: #f3e8ff;
+  border-color: #a855f7;
+  color: #7c3aed;
+}
 QTextEdit#logView {
   background: #0f172a;
   color: #94a3b8;
@@ -660,12 +844,15 @@ QScrollBar::handle:vertical {
         header.setFixedHeight(58)
         h_layout = QHBoxLayout(header)
         h_layout.setContentsMargins(20, 0, 20, 0)
-        h_layout.setSpacing(12)
-        title_lbl = QLabel("PSD Batch Renderer")
+        h_layout.setSpacing(10)
+        logo_lbl = QLabel("PS")
+        logo_lbl.setObjectName("appLogo")
+        title_lbl = QLabel("Photoshop Render Studio")
         title_lbl.setObjectName("appTitle")
         self.psd_badge = QLabel("no PSD selected")
         self.psd_badge.setObjectName("psdBadge")
         self.psd_badge.setMaximumWidth(400)
+        h_layout.addWidget(logo_lbl)
         h_layout.addWidget(title_lbl)
         h_layout.addWidget(self.psd_badge)
         h_layout.addStretch(1)
@@ -678,14 +865,39 @@ QScrollBar::handle:vertical {
         outer.addWidget(content)
 
         # ── Files ────────────────────────────────────────────
-        files_box = QGroupBox("Files")
-        files_form = QFormLayout(files_box)
-        files_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
-        files_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        files_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        files_form.setHorizontalSpacing(12)
-        files_form.setVerticalSpacing(8)
+        files_box = QGroupBox("Setup")
+        files_box.setObjectName("setupCard")
+        files_layout = QVBoxLayout(files_box)
+        files_layout.setSpacing(10)
         content_layout.addWidget(files_box)
+
+        shared_setup_box = QGroupBox("Shared Setup")
+        shared_setup_box.setObjectName("setupSubCard")
+        shared_form = QFormLayout(shared_setup_box)
+        shared_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        shared_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        shared_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        shared_form.setHorizontalSpacing(12)
+        shared_form.setVerticalSpacing(8)
+        files_layout.addWidget(shared_setup_box)
+
+        self.local_setup_box = QWidget()
+        local_form = QFormLayout(self.local_setup_box)
+        local_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        local_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        local_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        local_form.setHorizontalSpacing(12)
+        local_form.setVerticalSpacing(8)
+        self.local_setup_expander, self.local_setup_toggle, self.local_setup_body = self._make_expander(
+            "Local Generation Setup",
+            expanded=False,
+            tone="local",
+        )
+        local_setup_body_layout = QVBoxLayout(self.local_setup_body)
+        local_setup_body_layout.setContentsMargins(0, 0, 0, 0)
+        local_setup_body_layout.setSpacing(0)
+        local_setup_body_layout.addWidget(self.local_setup_box)
+        files_layout.addWidget(self.local_setup_expander)
 
         psd_row = QHBoxLayout()
         self.psd_edit = QLineEdit()
@@ -701,16 +913,16 @@ QScrollBar::handle:vertical {
         psd_row.addWidget(self.psd_edit, 1)
         psd_row.addWidget(psd_btn)
         psd_row.addWidget(scan_btn)
-        files_form.addRow(
+        shared_form.addRow(
             self._label_with_help(
                 "PSD Template",
-                "Photoshop source file. Scan Colors reads the available style groups from this PSD.",
+                "Main Photoshop source file. Local Generation and Website Orders both use this PSD unless the website-order worker is restarted with a different one.",
             ),
             self._wrap(psd_row),
         )
 
         out_row = QHBoxLayout()
-        self.out_edit = QLineEdit(str(DEFAULT_OUTPUT))
+        self.out_edit = QLineEdit(format_preferred_path(DEFAULT_OUTPUT))
         self.out_edit.textChanged.connect(self.refresh_letter_summary)
         self.out_edit.textChanged.connect(self.refresh_scratch_status)
         out_btn = QPushButton("Browse")
@@ -723,13 +935,19 @@ QScrollBar::handle:vertical {
         out_row.addWidget(self.out_edit, 1)
         out_row.addWidget(out_btn)
         out_row.addWidget(open_out_btn)
-        files_form.addRow(
+        local_form.addRow(
             self._label_with_help(
                 "Output Folder",
-                "PNG files are written here. Resume logic also checks this folder and skips files that already exist.",
+                "Local Generation writes PNG files here. Resume logic also checks this folder and skips files that already exist.",
             ),
             self._wrap(out_row),
         )
+        self.output_scope_label = QLabel(
+            "Used by Local Generation only. Website Orders uses its own worker folder under output/request_worker. Repo folders are shown as relative paths when possible."
+        )
+        self.output_scope_label.setObjectName("subtleMeta")
+        self.output_scope_label.setWordWrap(True)
+        local_form.addRow("", self.output_scope_label)
 
         names_row = QHBoxLayout()
         self.names_file_combo = QComboBox()
@@ -744,18 +962,24 @@ QScrollBar::handle:vertical {
         names_row.addWidget(self.names_file_combo, 1)
         names_row.addWidget(names_browse_btn)
         names_row.addWidget(names_open_btn)
-        files_form.addRow(
+        local_form.addRow(
             self._label_with_help(
                 "Names TXT",
-                "Choose which names list Full mode uses. Letter counts, coverage, and batch rendering all follow this selected txt file.",
+                "Choose which names list Local Generation uses in Full and Test modes. The built-in dropdown is intentionally short: curated names plus popular batch files. If you need a special TXT file, use Browse.",
             ),
             self._wrap(names_row),
         )
+        self.names_scope_label = QLabel(
+            "Used only in Local Generation Full and Test modes. Typed Name and Website Orders ignore this list."
+        )
+        self.names_scope_label.setObjectName("subtleMeta")
+        self.names_scope_label.setWordWrap(True)
+        local_form.addRow("", self.names_scope_label)
         self.names_warning_label = QLabel("")
         self.names_warning_label.setObjectName("warningBox")
         self.names_warning_label.setWordWrap(True)
         self.names_warning_label.setVisible(False)
-        files_form.addRow("", self.names_warning_label)
+        local_form.addRow("", self.names_warning_label)
 
         self.scratch_status_label = QLabel("Checking scratch disk...")
         self.scratch_status_label.setWordWrap(True)
@@ -768,10 +992,10 @@ QScrollBar::handle:vertical {
         self.scratch_cleanup_btn.setToolTip("Delete Photoshop temp/scratch cache files from system temp folders, then re-check free disk space.")
         self.scratch_cleanup_btn.clicked.connect(self.cleanup_scratch_temp_files)
         scratch_row.addWidget(self.scratch_cleanup_btn)
-        files_form.addRow(
+        shared_form.addRow(
             self._label_with_help(
                 "Scratch Disk",
-                "Live free-space check for the PSD, output, home, and temp volumes Photoshop may use. Start already auto-cleans Photoshop temp files; Free Temp Files lets you run that cleanup manually first.",
+                "Live free-space check for the PSD, local output, home, and temp volumes Photoshop may use. Start already auto-cleans Photoshop temp files; Free Temp Files lets you run that cleanup manually first.",
             ),
             self._wrap(scratch_row),
         )
@@ -787,15 +1011,25 @@ QScrollBar::handle:vertical {
             ps_btn.clicked.connect(self.pick_ps_exec)
             ps_row.addWidget(self.ps_exec_edit, 1)
             ps_row.addWidget(ps_btn)
-            files_form.addRow("Photoshop Exec", self._wrap(ps_row))
+            shared_form.addRow("Photoshop Exec", self._wrap(ps_row))
         else:
             self.ps_exec_edit = QLineEdit()  # hidden, kept for compat
 
         # ── Render Settings ──────────────────────────────────
         settings_box = QGroupBox("Render Settings")
+        settings_box.setObjectName("renderCard")
         settings_layout = QVBoxLayout(settings_box)
         settings_layout.setSpacing(10)
         content_layout.addWidget(settings_box)
+
+        self.single_name_expander, self.single_name_toggle, self.single_name_body = self._make_expander(
+            "Local Generation",
+            expanded=False,
+            tone="local",
+        )
+        single_name_body_layout = QVBoxLayout(self.single_name_body)
+        single_name_body_layout.setContentsMargins(0, 0, 0, 0)
+        single_name_body_layout.setSpacing(10)
 
         row1 = QHBoxLayout()
         row1.setSpacing(12)
@@ -804,22 +1038,36 @@ QScrollBar::handle:vertical {
         mode_col.addWidget(
             self._label_with_help(
                 "Mode",
-                "Full renders the selected names file. Test renders the first N names from the selected names file. Custom renders one typed name locally. Single renders one typed name and then imports it to Supabase.",
+                "Full renders the selected names file. Test renders the first 5 names from the selected names file. Typed name renders one name on this computer.",
             )
         )
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Full  —  names file", "full")
-        self.mode_combo.addItem("Test  —  first 1 name", "test20_1")
         self.mode_combo.addItem("Test  —  first 5 names", "test20_5")
-        self.mode_combo.addItem("Test  —  first 10 names", "test20_10")
-        self.mode_combo.addItem("Test  —  first 20 names", "test20_20")
-        self.mode_combo.addItem("Test  —  first 50 names", "test20_50")
-        self.mode_combo.addItem("Custom  —  typed name", "custom")
-        self.mode_combo.addItem("Single  —  typed name + Supabase", "single")
+        self.mode_combo.addItem("Typed Name  —  local generation", "custom")
         self.mode_combo.currentIndexChanged.connect(self.on_mode_change)
         mode_col.addWidget(self.mode_combo)
-        row1.addLayout(mode_col, 3)
+        row1.addLayout(mode_col, 1)
+        single_name_body_layout.addLayout(row1)
 
+        self.workflow_pause_label = QLabel("")
+        self.workflow_pause_label.setWordWrap(True)
+        self.workflow_pause_label.setVisible(False)
+        single_name_body_layout.addWidget(self.workflow_pause_label)
+        self.batch_settings_panel = QWidget()
+        batch_body_layout = QVBoxLayout(self.batch_settings_panel)
+        batch_body_layout.setContentsMargins(0, 0, 0, 0)
+        batch_body_layout.setSpacing(10)
+
+        batch_note = QLabel(
+            "Use this section for Full and Test modes. These settings control batch chunking, retry behavior, and letter filtering."
+        )
+        batch_note.setObjectName("subtleMeta")
+        batch_note.setWordWrap(True)
+        batch_body_layout.addWidget(batch_note)
+
+        letters_row = QHBoxLayout()
+        letters_row.setSpacing(12)
         letters_col = QVBoxLayout()
         letters_col.setSpacing(4)
         letters_col.addWidget(
@@ -831,8 +1079,8 @@ QScrollBar::handle:vertical {
         self.letters_edit = QLineEdit("ABC")
         self.letters_edit.textChanged.connect(self._on_letters_text_changed)
         letters_col.addWidget(self.letters_edit)
-        row1.addLayout(letters_col, 2)
-        settings_layout.addLayout(row1)
+        letters_row.addLayout(letters_col, 1)
+        batch_body_layout.addLayout(letters_row)
 
         row2 = QHBoxLayout()
         row2.setSpacing(12)
@@ -863,9 +1111,11 @@ QScrollBar::handle:vertical {
             setattr(self, attr, spin)
             col.addWidget(spin)
             row2.addLayout(col, 1)
-        settings_layout.addLayout(row2)
+        batch_body_layout.addLayout(row2)
+        single_name_body_layout.addWidget(self.batch_settings_panel)
 
         self.custom_section = QGroupBox("Typed Name")
+        self.custom_section.setObjectName("renderSubCard")
         custom_layout = QVBoxLayout(self.custom_section)
         custom_layout.setSpacing(6)
         custom_layout.addWidget(
@@ -876,10 +1126,9 @@ QScrollBar::handle:vertical {
         )
         self.custom_names_edit = QLineEdit()
         self.custom_names_edit.setPlaceholderText("Enter one name  (example: Kerem)")
-        self.custom_names_edit.textChanged.connect(self._refresh_single_save_ui)
         custom_layout.addWidget(self.custom_names_edit)
         self.custom_name_hint_label = QLabel(
-            "Custom saves locally. Single uses the same typed name flow and then imports the rendered PNGs to Supabase."
+            "Generates one typed name on this computer and saves the PNG to the selected output folder."
         )
         self.custom_name_hint_label.setObjectName("subtleMeta")
         self.custom_name_hint_label.setWordWrap(True)
@@ -962,11 +1211,100 @@ QScrollBar::handle:vertical {
         self.single_save_result_label.setWordWrap(True)
         self.single_save_result_label.setVisible(False)
         single_save_layout.addWidget(self.single_save_result_label)
+        self.single_save_card.setVisible(False)
 
         custom_layout.addWidget(self.single_save_card)
-        settings_layout.addWidget(self.custom_section)
+        self.request_worker_section = QGroupBox("Automatic Website Orders")
+        self.request_worker_section.setObjectName("renderSubCard")
+        request_worker_layout = QVBoxLayout(self.request_worker_section)
+        request_worker_layout.setSpacing(8)
+
+        request_top_row = QHBoxLayout()
+        request_top_row.setSpacing(12)
+        self.request_worker_enabled_check = QCheckBox("Process website orders automatically")
+        self.request_worker_enabled_check.stateChanged.connect(self._on_request_worker_enabled_changed)
+        request_top_row.addWidget(self.request_worker_enabled_check, 1)
+
+        poll_col = QVBoxLayout()
+        poll_col.setSpacing(4)
+        poll_col.addWidget(
+            self._label_with_help(
+                "Poll (sec)",
+                "How often the desktop app checks Supabase for a new render request. "
+                "Changing this while the worker is already running requires a restart.",
+            )
+        )
+        self.request_worker_poll_spin = QSpinBox()
+        self.request_worker_poll_spin.setRange(2, 3600)
+        self.request_worker_poll_spin.setValue(10)
+        self.request_worker_poll_spin.valueChanged.connect(self._refresh_request_worker_ui)
+        poll_col.addWidget(self.request_worker_poll_spin)
+        request_top_row.addLayout(poll_col)
+        request_worker_layout.addLayout(request_top_row)
+
+        request_note = QLabel(
+            "This mode watches for new website orders, renders them automatically in Photoshop, and sends the result back online. While it is on, local render controls are paused."
+        )
+        request_note.setObjectName("subtleMeta")
+        request_note.setWordWrap(True)
+        request_worker_layout.addWidget(request_note)
+
+        self.request_worker_psd_label = QLabel("")
+        self.request_worker_psd_label.setObjectName("subtleMeta")
+        self.request_worker_psd_label.setWordWrap(True)
+        self.request_worker_psd_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        request_worker_layout.addWidget(self.request_worker_psd_label)
+
+        self.request_worker_config_label = QLabel("")
+        self.request_worker_config_label.setObjectName("subtleMeta")
+        self.request_worker_config_label.setWordWrap(True)
+        self.request_worker_config_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        request_worker_layout.addWidget(self.request_worker_config_label)
+
+        self.request_worker_paths_label = QLabel("")
+        self.request_worker_paths_label.setObjectName("subtleMeta")
+        self.request_worker_paths_label.setWordWrap(True)
+        self.request_worker_paths_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        request_worker_layout.addWidget(self.request_worker_paths_label)
+
+        request_btn_row = QHBoxLayout()
+        request_btn_row.setSpacing(8)
+        self.request_worker_restart_btn = QPushButton("Restart Order Mode")
+        self.request_worker_restart_btn.setObjectName("softBtn")
+        self.request_worker_restart_btn.clicked.connect(self.restart_request_worker)
+        self.request_worker_open_log_btn = QPushButton("Open Activity Log ↗")
+        self.request_worker_open_log_btn.setObjectName("softBtn")
+        self.request_worker_open_log_btn.clicked.connect(self._open_request_worker_log)
+        request_btn_row.addWidget(self.request_worker_restart_btn)
+        request_btn_row.addWidget(self.request_worker_open_log_btn)
+        request_btn_row.addStretch(1)
+        request_worker_layout.addWidget(self._wrap(request_btn_row))
+
+        self.request_worker_status_label = QLabel("")
+        self.request_worker_status_label.setWordWrap(True)
+        self.request_worker_status_label.setVisible(False)
+        request_worker_layout.addWidget(self.request_worker_status_label)
+
+        self.request_worker_result_label = QLabel("")
+        self.request_worker_result_label.setWordWrap(True)
+        self.request_worker_result_label.setVisible(False)
+        request_worker_layout.addWidget(self.request_worker_result_label)
+
+        self.request_worker_expander, self.request_worker_toggle, self.request_worker_body = self._make_expander(
+            "Website Orders",
+            expanded=True,
+            tone="orders",
+        )
+        request_worker_body_layout = QVBoxLayout(self.request_worker_body)
+        request_worker_body_layout.setContentsMargins(0, 0, 0, 0)
+        request_worker_body_layout.setSpacing(10)
+        request_worker_body_layout.addWidget(self.request_worker_section)
+        settings_layout.addWidget(self.request_worker_expander)
+        single_name_body_layout.addWidget(self.custom_section)
+        settings_layout.addWidget(self.single_name_expander)
 
         self.letter_section = QGroupBox("Letter Coverage")
+        self.letter_section.setObjectName("renderSubCard")
         letter_outer = QVBoxLayout(self.letter_section)
         letter_outer.setSpacing(8)
 
@@ -1011,13 +1349,14 @@ QScrollBar::handle:vertical {
         self.letter_layout.setHorizontalSpacing(8)
         self.letter_layout.setVerticalSpacing(6)
         letter_outer.addWidget(self.letter_group)
-        settings_layout.addWidget(self.letter_section)
+        batch_body_layout.addWidget(self.letter_section)
 
         # ── Color Palette ────────────────────────────────────
-        styles_box = QGroupBox("Color Palette")
-        styles_outer = QVBoxLayout(styles_box)
+        self.styles_box = QGroupBox("Color Palette")
+        self.styles_box.setObjectName("renderSubCard")
+        styles_outer = QVBoxLayout(self.styles_box)
         styles_outer.setSpacing(8)
-        content_layout.addWidget(styles_box)
+        single_name_body_layout.addWidget(self.styles_box)
 
         ctl_row = QHBoxLayout()
         ctl_row.addWidget(
@@ -1053,25 +1392,30 @@ QScrollBar::handle:vertical {
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
-        self.start_btn = QPushButton("▶  Start / Resume")
+        self.start_btn = QPushButton("Start Local Generation")
         self.start_btn.setObjectName("primaryBtn")
-        self.start_btn.setMinimumHeight(44)
+        self.start_btn.setMinimumHeight(46)
         self.start_btn.clicked.connect(self.start_run)
-        self.stop_btn = QPushButton("■  Stop")
+        self.stop_btn = QPushButton("Stop Run")
         self.stop_btn.setObjectName("dangerBtn")
-        self.stop_btn.setMinimumHeight(44)
-        self.stop_btn.setFixedWidth(100)
+        self.stop_btn.setMinimumHeight(46)
+        self.stop_btn.setMinimumWidth(120)
         self.stop_btn.clicked.connect(self.stop_run)
-        refresh_btn = QPushButton("↻")
-        refresh_btn.setObjectName("ghostBtn")
-        refresh_btn.setMinimumHeight(44)
-        refresh_btn.setFixedWidth(44)
-        refresh_btn.setToolTip("Refresh status")
-        refresh_btn.clicked.connect(self.refresh_status)
+        self.refresh_btn = QPushButton("Refresh Status")
+        self.refresh_btn.setObjectName("softBtn")
+        self.refresh_btn.setMinimumHeight(46)
+        self.refresh_btn.setMinimumWidth(140)
+        self.refresh_btn.setToolTip("Refresh local run progress and status")
+        self.refresh_btn.clicked.connect(self.refresh_status)
         btn_row.addWidget(self.start_btn, 1)
         btn_row.addWidget(self.stop_btn)
-        btn_row.addWidget(refresh_btn)
+        btn_row.addWidget(self.refresh_btn)
         action_layout.addLayout(btn_row)
+
+        self.action_hint_label = QLabel("")
+        self.action_hint_label.setObjectName("subtleMeta")
+        self.action_hint_label.setWordWrap(True)
+        action_layout.addWidget(self.action_hint_label)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -1153,25 +1497,70 @@ QScrollBar::handle:vertical {
     def _label_with_help(self, text: str, help_text: str) -> QWidget:
         row = QHBoxLayout()
         row.setSpacing(6)
-        row.addWidget(QLabel(text))
+        label = QLabel(text)
+        label.setObjectName("fieldLabel")
+        row.addWidget(label)
         row.addWidget(self._help_icon(help_text))
         row.addStretch(1)
         return self._wrap(row)
 
+    def _make_expander(self, title: str, *, expanded: bool = False, tone: str = "local") -> tuple[QWidget, QToolButton, QWidget]:
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+
+        toggle = QToolButton()
+        toggle.setObjectName("sectionToggleBtn")
+        toggle.setProperty("sectionTone", tone)
+        toggle.setText(title)
+        toggle.setCheckable(True)
+        toggle.setChecked(expanded)
+        toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        toggle.setCursor(Qt.PointingHandCursor)
+        toggle.setMinimumHeight(42)
+        toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        body = QWidget()
+        body.setVisible(expanded)
+
+        def on_toggled(checked: bool) -> None:
+            body.setVisible(checked)
+            toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+        toggle.toggled.connect(on_toggled)
+        outer.addWidget(toggle)
+        outer.addWidget(body)
+        return container, toggle, body
+
+    @staticmethod
+    def _set_expander_state(toggle: QToolButton, body: QWidget, expanded: bool) -> None:
+        if toggle.isChecked() == expanded and body.isVisible() == expanded:
+            return
+        toggle.blockSignals(True)
+        toggle.setChecked(expanded)
+        toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        toggle.blockSignals(False)
+        body.setVisible(expanded)
+
     def on_mode_change(self) -> None:
         mode = str(self.mode_combo.currentData())
+        is_batch_mode = mode != "custom"
         self.letters_edit.setEnabled(mode == "full")
+        self.batch_settings_panel.setVisible(is_batch_mode)
         self.letter_section.setVisible(mode == "full")
-        is_typed_name_mode = mode in {"custom", "single"}
-        is_single_supabase_mode = mode == "single"
+        is_typed_name_mode = mode == "custom"
         self.custom_names_edit.setEnabled(is_typed_name_mode)
         self.custom_section.setVisible(is_typed_name_mode)
-        self.single_save_card.setVisible(is_single_supabase_mode)
+        self.single_save_card.setVisible(False)
         self.save_single_supabase_check.blockSignals(True)
-        self.save_single_supabase_check.setChecked(is_single_supabase_mode)
+        self.save_single_supabase_check.setChecked(False)
         self.save_single_supabase_check.blockSignals(False)
+        if self.request_worker_enabled_check.isChecked():
+            self._set_expander_state(self.request_worker_toggle, self.request_worker_body, True)
         self._update_names_file_warning()
-        self._refresh_single_save_ui()
+        self._sync_workflow_state()
 
     def _render_letter_filters(self) -> None:
         while self.letter_layout.count():
@@ -1214,7 +1603,7 @@ QScrollBar::handle:vertical {
         return list(self.style_checks) or list(STYLE_CHOICES)
 
     def _current_output_path(self) -> Path:
-        return Path(self.out_edit.text().strip() or str(DEFAULT_OUTPUT)).expanduser().resolve()
+        return resolve_project_path(self.out_edit.text().strip(), default=DEFAULT_OUTPUT)
 
     @staticmethod
     def _free_gib(path: Path) -> float:
@@ -1228,6 +1617,18 @@ QScrollBar::handle:vertical {
 
     def _manual_stop_flag_path(self) -> Path:
         return self._current_output_path() / "manual_stop.flag"
+
+    def _request_worker_dir(self) -> Path:
+        return REQUEST_WORKER_DIR
+
+    def _request_worker_log_path(self) -> Path:
+        return self._request_worker_dir() / "worker.log"
+
+    def _request_worker_pid_path(self) -> Path:
+        return self._request_worker_dir() / "worker.pid"
+
+    def _request_worker_status_path(self) -> Path:
+        return self._request_worker_dir() / "worker_status.json"
 
     @staticmethod
     def _is_pid_running(pid: int) -> bool:
@@ -1251,6 +1652,19 @@ QScrollBar::handle:vertical {
     def _write_worker_pid(self, pid: int) -> None:
         self.worker_pid = pid
         self._worker_pid_path().write_text(f"{pid}\n", encoding="utf-8")
+
+    def _clear_request_worker_pid(self) -> None:
+        self.request_worker_pid = None
+        try:
+            self._request_worker_pid_path().unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    def _write_request_worker_pid(self, pid: int) -> None:
+        self.request_worker_pid = pid
+        self._request_worker_pid_path().write_text(f"{pid}\n", encoding="utf-8")
 
     def _discover_worker_pid(self) -> int | None:
         try:
@@ -1304,6 +1718,58 @@ QScrollBar::handle:vertical {
         self._clear_worker_pid()
         return None
 
+    def _discover_request_worker_pid(self) -> int | None:
+        try:
+            result = subprocess.run(
+                ["ps", "ax", "-o", "pid=", "-o", "command="],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        worker_root = str(self._request_worker_dir())
+        for line in result.stdout.splitlines():
+            row = line.strip()
+            if not row or REQUEST_WORKER_FLAG not in row or worker_root not in row:
+                continue
+            parts = row.split(maxsplit=1)
+            if not parts:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            if self._is_pid_running(pid):
+                return pid
+        return None
+
+    def _read_request_worker_pid(self) -> int | None:
+        if self.request_worker_pid and self._is_pid_running(self.request_worker_pid):
+            return self.request_worker_pid
+        pid_path = self._request_worker_pid_path()
+        if not pid_path.exists():
+            discovered = self._discover_request_worker_pid()
+            if discovered:
+                self.request_worker_pid = discovered
+                return discovered
+            self.request_worker_pid = None
+            return None
+        try:
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            self._clear_request_worker_pid()
+            return None
+        if self._is_pid_running(pid):
+            self.request_worker_pid = pid
+            return pid
+        discovered = self._discover_request_worker_pid()
+        if discovered:
+            self.request_worker_pid = discovered
+            return discovered
+        self._clear_request_worker_pid()
+        return None
+
     def _append_run_log(self, text: str) -> None:
         self._run_log_path().parent.mkdir(parents=True, exist_ok=True)
         with self._run_log_path().open("a", encoding="utf-8") as handle:
@@ -1331,6 +1797,45 @@ QScrollBar::handle:vertical {
         self._manual_stop_flag_path().unlink(missing_ok=True)
         self._write_worker_pid(proc.pid)
         return proc.pid
+
+    def _start_request_worker_detached(self, cmd: list[str], reset_log: bool) -> int:
+        worker_dir = self._request_worker_dir()
+        worker_dir.mkdir(parents=True, exist_ok=True)
+        if reset_log:
+            self._request_worker_log_path().write_text("", encoding="utf-8")
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        log_handle = self._request_worker_log_path().open("a", encoding="utf-8")
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env=env,
+            )
+        finally:
+            log_handle.close()
+        self._write_request_worker_pid(proc.pid)
+        return proc.pid
+
+    def _terminate_detached_pid(self, pid: int) -> None:
+        if pid <= 0:
+            return
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            return
+        deadline = time.time() + 4.0
+        while time.time() < deadline and self._is_pid_running(pid):
+            time.sleep(0.2)
+        if self._is_pid_running(pid):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
 
     def _set_scratch_status(self, text: str, tone: str, tooltip: str = "") -> None:
         self.scratch_status_text = text
@@ -1768,6 +2273,7 @@ QScrollBar::handle:vertical {
         self.psd_badge.setToolTip(text)
         self.refresh_scratch_status()
         self._update_names_file_warning()
+        self._refresh_request_worker_ui()
 
     def _update_style_badge(self) -> None:
         selected = sum(1 for cb in self.style_checks.values() if cb.isChecked())
@@ -1776,7 +2282,7 @@ QScrollBar::handle:vertical {
         self._refresh_single_save_ui()
 
     def _open_output_folder(self) -> None:
-        path = Path(self.out_edit.text().strip() or str(DEFAULT_OUTPUT))
+        path = self._current_output_path()
         path.mkdir(parents=True, exist_ok=True)
         self._open_path(path)
 
@@ -1786,9 +2292,9 @@ QScrollBar::handle:vertical {
             self.psd_edit.setText(path)
 
     def pick_output(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Output Folder", str(DEFAULT_OUTPUT))
+        path = QFileDialog.getExistingDirectory(self, "Select Output Folder", str(self._current_output_path()))
         if path:
-            self.out_edit.setText(path)
+            self.out_edit.setText(format_preferred_path(path))
 
     def pick_ps_exec(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select Photoshop Executable")
@@ -1813,6 +2319,55 @@ QScrollBar::handle:vertical {
 
     def _set_status(self, msg: str) -> None:
         self.status_label.setText(msg)
+        self._refresh_action_buttons()
+
+    def _local_run_is_active(self) -> bool:
+        live_pid = self._read_worker_pid()
+        if live_pid:
+            return True
+        return bool(self.proc and self.proc.state() != QProcess.NotRunning)
+
+    def _has_resume_candidate(self) -> bool:
+        try:
+            progress = self._current_output_path() / "progress.json"
+        except Exception:  # noqa: BLE001
+            return False
+        if not progress.exists():
+            return False
+        try:
+            payload = json.loads(progress.read_text(encoding="utf-8"))
+            done = int(payload.get("done", 0))
+            total = int(payload.get("total", 0))
+            remaining = int(payload.get("remaining", max(total - done, 0)))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return False
+        return total > 0 and done > 0 and remaining > 0
+
+    def _refresh_action_buttons(self) -> None:
+        if not hasattr(self, "start_btn"):
+            return
+        website_orders_active = bool(
+            hasattr(self, "request_worker_enabled_check") and self.request_worker_enabled_check.isChecked()
+        )
+        local_run_active = self._local_run_is_active()
+        resume_candidate = (not website_orders_active) and (not local_run_active) and self._has_resume_candidate()
+
+        if website_orders_active:
+            self.start_btn.setText("Local Generation Paused")
+            self.action_hint_label.setText("Website Orders is active. Turn it off to start a local render.")
+        elif local_run_active:
+            self.start_btn.setText("Local Generation Running")
+            self.action_hint_label.setText("A local render is running now. Stop it only if you want to cancel the current run.")
+        elif resume_candidate:
+            self.start_btn.setText("Resume Local Generation")
+            self.action_hint_label.setText("An unfinished local run was detected. You can resume from the current progress.")
+        else:
+            self.start_btn.setText("Start Local Generation")
+            self.action_hint_label.setText("Ready to render on this computer.")
+
+        self.start_btn.setEnabled((not website_orders_active) and (not local_run_active))
+        self.stop_btn.setEnabled(local_run_active)
+        self.refresh_btn.setEnabled(True)
 
     def append_log(self, text: str) -> None:
         self.log.moveCursor(QTextCursor.End)
@@ -1831,6 +2386,267 @@ QScrollBar::handle:vertical {
         self._set_box_kind(self.single_save_result_label, kind)
         self.single_save_result_label.setText(text.strip())
         self.single_save_result_label.setVisible(visible and bool(text.strip()))
+
+    def _set_request_worker_status(self, text: str, kind: str) -> None:
+        self._set_box_kind(self.request_worker_status_label, kind)
+        self.request_worker_status_label.setText(text.strip())
+        self.request_worker_status_label.setVisible(bool(text.strip()))
+
+    def _set_request_worker_result(self, text: str, kind: str, *, visible: bool = True) -> None:
+        self._set_box_kind(self.request_worker_result_label, kind)
+        self.request_worker_result_label.setText(text.strip())
+        self.request_worker_result_label.setVisible(visible and bool(text.strip()))
+
+    def _sync_workflow_state(self) -> None:
+        if not hasattr(self, "request_worker_enabled_check"):
+            return
+        website_orders_active = self.request_worker_enabled_check.isChecked()
+        local_render_enabled = not website_orders_active
+        if hasattr(self, "workflow_pause_label"):
+            self._set_box_kind(self.workflow_pause_label, "warning" if website_orders_active else "info")
+            self.workflow_pause_label.setText(
+                "Website Orders mode is on. You can still browse settings, but local render inputs and Start are paused."
+                if website_orders_active
+                else ""
+            )
+            self.workflow_pause_label.setVisible(website_orders_active)
+        if hasattr(self, "batch_settings_panel"):
+            self.batch_settings_panel.setEnabled(local_render_enabled)
+        if hasattr(self, "single_name_body"):
+            self.single_name_body.setEnabled(local_render_enabled)
+        if hasattr(self, "styles_box"):
+            self.styles_box.setEnabled(local_render_enabled)
+        if hasattr(self, "start_btn"):
+            self.start_btn.setEnabled(local_render_enabled)
+            self.start_btn.setToolTip(
+                "" if local_render_enabled else "Turn off Website Orders mode to use local render controls."
+            )
+        self._refresh_action_buttons()
+
+    def _request_worker_cmd(self) -> list[str]:
+        load_single_save_config()
+        psd = Path(self.psd_edit.text().strip() or str(DEFAULT_PSD)).expanduser().resolve()
+        if not psd.exists():
+            raise ValueError(f"PSD not found for request worker: {psd}")
+        worker_dir = self._request_worker_dir()
+        worker_dir.mkdir(parents=True, exist_ok=True)
+        return build_request_worker_command(
+            [
+                "--poll-interval",
+                str(self.request_worker_poll_spin.value()),
+                "--status-file",
+                str(self._request_worker_status_path()),
+                "--psd",
+                str(psd),
+                "--render-output-dir",
+                str(worker_dir / "renders"),
+            ]
+        )
+
+    def _load_request_worker_status_payload(self) -> dict[str, object]:
+        path = self._request_worker_status_path()
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _open_request_worker_log(self) -> None:
+        path = self._request_worker_log_path()
+        if path.exists():
+            self._open_path(path)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._open_path(path.parent)
+
+    def start_request_worker(self, *, quiet: bool = False) -> int | None:
+        live_pid = self._read_request_worker_pid()
+        if live_pid:
+            self._refresh_request_worker_ui()
+            return live_pid
+        if self._read_worker_pid():
+            raise RuntimeError("Stop the current local render first, then turn on Website Orders mode.")
+        try:
+            cmd = self._request_worker_cmd()
+        except Exception as exc:  # noqa: BLE001
+            self._set_request_worker_status(f"Website orders config error: {exc}", "error")
+            self._set_request_worker_result("", "info", visible=False)
+            if not quiet:
+                QMessageBox.critical(self, "Website Orders", str(exc))
+            raise
+
+        self._request_worker_log_path().parent.mkdir(parents=True, exist_ok=True)
+        self._request_worker_log_path().write_text("", encoding="utf-8")
+        with self._request_worker_log_path().open("a", encoding="utf-8") as handle:
+            handle.write("[APP] START " + " ".join(cmd) + "\n")
+        pid = self._start_request_worker_detached(cmd, reset_log=False)
+        self._set_request_worker_status(f"Website orders mode starting (pid {pid}).", "info")
+        self._set_request_worker_result(
+            "Website orders mode is active. Local render controls are paused. Use Restart Order Mode after changing PSD path or poll interval.",
+            "info",
+        )
+        return pid
+
+    def stop_request_worker(self) -> None:
+        live_pid = self._read_request_worker_pid()
+        if live_pid:
+            self._terminate_detached_pid(live_pid)
+        self._clear_request_worker_pid()
+        self._set_request_worker_status("Website orders mode stopped. Local render controls are available again.", "info")
+        self._set_request_worker_result("", "info", visible=False)
+
+    def restart_request_worker(self) -> None:
+        if not self.request_worker_enabled_check.isChecked():
+            self.request_worker_enabled_check.setChecked(True)
+            return
+        live_pid = self._read_request_worker_pid()
+        if live_pid:
+            self._terminate_detached_pid(live_pid)
+            self._clear_request_worker_pid()
+        try:
+            self.start_request_worker()
+        except Exception:  # noqa: BLE001
+            self.request_worker_enabled_check.blockSignals(True)
+            self.request_worker_enabled_check.setChecked(False)
+            self.request_worker_enabled_check.blockSignals(False)
+            self._save_settings()
+        self._refresh_request_worker_ui()
+
+    def _restore_request_worker_state(self) -> None:
+        if not self.request_worker_enabled_check.isChecked():
+            self._refresh_request_worker_ui()
+            return
+        if self._read_worker_pid():
+            self.request_worker_enabled_check.blockSignals(True)
+            self.request_worker_enabled_check.setChecked(False)
+            self.request_worker_enabled_check.blockSignals(False)
+            self._set_request_worker_status(
+                "Website orders mode stayed off because a local render is already running.",
+                "warning",
+            )
+            self._sync_workflow_state()
+            return
+        try:
+            self.start_request_worker(quiet=True)
+        except Exception:  # noqa: BLE001
+            self.request_worker_enabled_check.blockSignals(True)
+            self.request_worker_enabled_check.setChecked(False)
+            self.request_worker_enabled_check.blockSignals(False)
+        self._save_settings()
+        self._refresh_request_worker_ui()
+
+    def _on_request_worker_enabled_changed(self) -> None:
+        enabled = self.request_worker_enabled_check.isChecked()
+        try:
+            if enabled:
+                self.start_request_worker()
+            else:
+                self.stop_request_worker()
+        except Exception as exc:  # noqa: BLE001
+            self.request_worker_enabled_check.blockSignals(True)
+            self.request_worker_enabled_check.setChecked(False)
+            self.request_worker_enabled_check.blockSignals(False)
+            self._set_request_worker_status(
+                str(exc) or "Website orders mode could not be turned on.",
+                "warning",
+            )
+        self._save_settings()
+        self._refresh_request_worker_ui()
+
+    def _refresh_request_worker_ui(self) -> None:
+        if not hasattr(self, "request_worker_enabled_check"):
+            return
+        config_path = single_save_supabase_config_file()
+        psd_text = self.psd_edit.text().strip() or str(DEFAULT_PSD)
+        self.request_worker_psd_label.setText(
+            f"PSD used for website orders: {format_project_relative_path(psd_text)}"
+        )
+        self.request_worker_paths_label.setText(
+            f"Orders folder: {format_project_relative_path(self._request_worker_dir())}\n"
+            f"Activity log: {format_project_relative_path(self._request_worker_log_path())}\n"
+            f"Status file: {format_project_relative_path(self._request_worker_status_path())}"
+        )
+
+        config_error = ""
+        config_meta = ""
+        try:
+            config = load_single_save_config()
+            config_meta = (
+                f"Config file: {format_project_relative_path(config_path)}\n"
+                f"Request table: {config.request_table}  |  Cache table: {config.cache_table}  |  Bucket: {config.storage_bucket}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            config_error = str(exc)
+            config_meta = (
+                f"Config file: {format_project_relative_path(config_path)}\n"
+                f"Config issue: {config_error}"
+            )
+        self.request_worker_config_label.setText(config_meta)
+
+        payload = self._load_request_worker_status_payload()
+        live_pid = self._read_request_worker_pid()
+        state = str(payload.get("state") or "").strip()
+        last_message = str(payload.get("last_message") or "").strip()
+        current_request_id = str(payload.get("current_request_id") or "").strip()
+        current_request_text = str(payload.get("current_request_text") or "").strip()
+        last_poll_at = str(payload.get("last_poll_at") or "").strip()
+        last_claimed_at = str(payload.get("last_claimed_at") or "").strip()
+        try:
+            processed_count = int(payload.get("processed_count") or 0) if payload else 0
+        except (TypeError, ValueError):
+            processed_count = 0
+        try:
+            failed_count = int(payload.get("failed_count") or 0) if payload else 0
+        except (TypeError, ValueError):
+            failed_count = 0
+        try:
+            poll_interval = int(payload.get("poll_interval_seconds") or self.request_worker_poll_spin.value()) if payload else self.request_worker_poll_spin.value()
+        except (TypeError, ValueError):
+            poll_interval = self.request_worker_poll_spin.value()
+
+        if not self.request_worker_enabled_check.isChecked():
+            self._set_request_worker_status("Website orders mode is off. Local render controls are available.", "info")
+            self._set_request_worker_result("", "info", visible=False)
+            self._sync_workflow_state()
+            return
+        if config_error:
+            self._set_request_worker_status(f"Website orders config error: {config_error}", "error")
+            self._set_request_worker_result("", "info", visible=False)
+            self._sync_workflow_state()
+            return
+        if live_pid:
+            kind = "success" if state == "processing" else "info"
+            if state == "error":
+                kind = "warning"
+            status_text = (
+                f"Website orders mode is on (pid {live_pid}). Checking every {poll_interval}s. "
+                "Local render controls are paused."
+            )
+            if current_request_text:
+                status_text += f" Current name: {current_request_text}."
+            elif current_request_id:
+                status_text += f" Current order: {current_request_id}."
+            self._set_request_worker_status(status_text, kind)
+        else:
+            self._set_request_worker_status(
+                "Website orders mode is on but no background process was detected. Use Restart Order Mode if needed.",
+                "warning",
+            )
+
+        detail_lines: list[str] = []
+        if state:
+            detail_lines.append(f"Mode state: {state}")
+        if last_message:
+            detail_lines.append(f"Last update: {last_message}")
+        if last_poll_at:
+            detail_lines.append(f"Last check: {format_local_timestamp(last_poll_at)}")
+        if last_claimed_at:
+            detail_lines.append(f"Last order picked up: {format_local_timestamp(last_claimed_at)}")
+        detail_lines.append(f"Completed orders: {processed_count}  |  Failed checks: {failed_count}")
+        self._set_request_worker_result("\n".join(detail_lines), "info")
+        self._sync_workflow_state()
 
     def _open_single_save_config_location(self) -> None:
         path = single_save_supabase_config_file()
@@ -1853,74 +2669,12 @@ QScrollBar::handle:vertical {
     def _refresh_single_save_ui(self) -> None:
         if not hasattr(self, "save_single_supabase_check"):
             return
-        mode = str(self.mode_combo.currentData()) if hasattr(self, "mode_combo") else "full"
-        parsed = self._parsed_custom_names()
-        target_name = parsed[0] if parsed else ""
-        extra_count = max(0, len(parsed) - 1)
-        selected_styles = self.selected_styles() if hasattr(self, "style_checks") else []
-        archive_dir = default_single_supabase_export_dir()
-        config_path = single_save_supabase_config_file()
-
-        self.single_save_target_label.setText(
-            f"Target name: {target_name or 'enter one custom name'}"
-        )
-        if extra_count:
-            self.single_save_target_label.setText(
-                f"Target name: {target_name}  |  ignoring {extra_count} extra entr"
-                f"{'y' if extra_count == 1 else 'ies'}"
-            )
-        self.single_save_styles_label.setText(
-            f"Selected colors: {len(selected_styles)}  ({', '.join(selected_styles) if selected_styles else 'none selected'})"
-        )
-        self.single_save_archive_label.setText(f"Archive folder: {archive_dir}")
-
-        config_error = ""
-        config_meta = ""
-        try:
-            config = load_single_save_config()
-            config_meta = (
-                f"Config ready: bucket {config.storage_bucket}  |  table {config.cache_table}  |  "
-                f"folder {config.storage_folder}"
-            )
-        except Exception as exc:  # noqa: BLE001
-            config_error = str(exc)
-
-        self.single_save_config_label.setText(
-            f"Config file: {config_path}\n{config_meta or f'Config issue: {config_error}'}"
-        )
-
-        if mode != "single":
-            self._set_single_save_status(
-                "Single mode archives the rendered PNGs locally and then imports them into Supabase.",
-                "info",
-            )
-            return
-
-        if not target_name:
-            self._set_single_save_status(
-                "Enter one typed name first. Single mode renders and uploads only one name per run.",
-                "warning",
-            )
-            return
-        if not selected_styles:
-            self._set_single_save_status(
-                "Select at least one color style. The single-save upload uses the rendered PNGs from the currently selected styles.",
-                "warning",
-            )
-            return
-        if config_error:
-            self._set_single_save_status(
-                f"Upload is enabled but the Supabase config is not ready: {config_error}",
-                "error",
-            )
-            return
-
-        ready_text = (
-            f"Ready. After render, {len(selected_styles)} PNG"
-            f"{'' if len(selected_styles) == 1 else 's'} for {target_name} will be copied to {archive_dir} "
-            "and imported into Supabase. Existing cache keys will be skipped."
-        )
-        self._set_single_save_status(ready_text, "success")
+        self.single_save_card.setVisible(False)
+        self.save_single_supabase_check.blockSignals(True)
+        self.save_single_supabase_check.setChecked(False)
+        self.save_single_supabase_check.blockSignals(False)
+        self._set_single_save_status("", "info")
+        self._set_single_save_result("", "info", visible=False)
 
     @staticmethod
     def _parse_custom_names(raw: str) -> list[str]:
@@ -1935,7 +2689,7 @@ QScrollBar::handle:vertical {
 
     def build_cmd(self) -> list[str]:
         psd = Path(self.psd_edit.text().strip()).expanduser().resolve()
-        output = Path(self.out_edit.text().strip() or str(DEFAULT_OUTPUT)).expanduser().resolve()
+        output = self._current_output_path()
         names_file = self.selected_names_file()
         output.mkdir(parents=True, exist_ok=True)
         self.current_output = output
@@ -2042,7 +2796,7 @@ QScrollBar::handle:vertical {
                 "chunk_size": chunk_size,
                 "restart_every_chunks": restart_every_chunks,
             }
-        elif mode in {"custom", "single"}:
+        elif mode == "custom":
             raw = self.custom_names_edit.text().strip()
             if not raw:
                 raise ValueError("Typed-name mode selected but no single name was provided.")
@@ -2050,13 +2804,6 @@ QScrollBar::handle:vertical {
             if not parsed:
                 raise ValueError("Single name is empty. Enter one name.")
             selected_name = parsed[0]
-            save_single_supabase = mode == "single"
-            if save_single_supabase:
-                config = load_single_save_config()
-                self.append_log(
-                    f"[APP] Single-save armed for {selected_name}: "
-                    f"{len(styles)} style(s) -> {config.cache_table} via {config.storage_bucket}.\n"
-                )
             if len(parsed) > 1:
                 self.append_log(
                     f"[APP] Typed-name modes use only first name: {selected_name} "
@@ -2077,7 +2824,7 @@ QScrollBar::handle:vertical {
                 "styles": styles,
                 "custom_name": selected_name,
                 "custom_name_input": raw,
-                "save_single_supabase": save_single_supabase,
+                "save_single_supabase": False,
                 "names_file": str(names_file),
                 "chunk_size": chunk_size,
                 "restart_every_chunks": restart_every_chunks,
@@ -2099,6 +2846,13 @@ QScrollBar::handle:vertical {
         return build_worker_command(runner_args)
 
     def start_run(self) -> None:
+        if self.request_worker_enabled_check.isChecked():
+            QMessageBox.information(
+                self,
+                "Website Orders Active",
+                "Turn off Website Orders mode before starting a local render.",
+            )
+            return
         live_pid = self._read_worker_pid()
         if live_pid:
             QMessageBox.information(self, "Running", "A run is already in progress.")
@@ -2119,7 +2873,7 @@ QScrollBar::handle:vertical {
             if reply != QMessageBox.Yes:
                 self._set_status("start cancelled")
                 return
-        if str(self.mode_combo.currentData()) in {"custom", "single"}:
+        if str(self.mode_combo.currentData()) == "custom":
             self._set_single_save_result("", "info", visible=False)
         try:
             cmd = self.build_cmd()
@@ -2261,6 +3015,7 @@ QScrollBar::handle:vertical {
         if str(self.mode_combo.currentData()) == "full":
             self.refresh_letter_summary()
         self.refresh_scratch_status()
+        self._refresh_request_worker_ui()
         if not live_pid and allow_post_run:
             self._finalize_last_run()
 
@@ -2329,13 +3084,13 @@ QScrollBar::handle:vertical {
         if bool(self.last_run_meta.get("post_run_handled", False)):
             return
         self.last_run_meta["post_run_handled"] = True
-        if str(self.last_run_meta.get("mode", "")) not in {"custom", "single"}:
+        if str(self.last_run_meta.get("mode", "")) != "custom":
             return
         self._handle_custom_post_run()
 
     def _handle_custom_post_run(self) -> None:
         mode = str(self.last_run_meta.get("mode", ""))
-        if mode not in {"custom", "single"}:
+        if mode != "custom":
             return
         self.current_output = self._current_output_path()
         render_name, outputs = self._custom_render_outputs()
@@ -2394,7 +3149,7 @@ QScrollBar::handle:vertical {
     def _save_settings(self) -> None:
         payload = {
             "psd": self.psd_edit.text().strip(),
-            "output": self.out_edit.text().strip(),
+            "output": format_preferred_path(self.out_edit.text().strip() or DEFAULT_OUTPUT),
             "names_file": str(self.selected_names_file()),
             "mode": self.mode_combo.currentData(),
             "letters": self.letters_edit.text().strip(),
@@ -2409,6 +3164,8 @@ QScrollBar::handle:vertical {
             "custom_names": self.custom_names_edit.text().strip(),
             "auto_open_custom": self.auto_open_custom_check.isChecked(),
             "save_single_supabase": self.save_single_supabase_check.isChecked(),
+            "request_worker_enabled": self.request_worker_enabled_check.isChecked(),
+            "request_worker_poll_seconds": self.request_worker_poll_spin.value(),
         }
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_FILE.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -2416,30 +3173,26 @@ QScrollBar::handle:vertical {
     def _load_settings(self) -> None:
         if not SETTINGS_FILE.exists():
             self.psd_edit.setText(str(DEFAULT_PSD))
-            self.out_edit.setText(str(DEFAULT_OUTPUT))
+            self.out_edit.setText(format_preferred_path(DEFAULT_OUTPUT))
             self._refresh_single_save_ui()
             return
         try:
             cfg = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, ValueError, TypeError):
             self.psd_edit.setText(str(DEFAULT_PSD))
-            self.out_edit.setText(str(DEFAULT_OUTPUT))
+            self.out_edit.setText(format_preferred_path(DEFAULT_OUTPUT))
             self._refresh_single_save_ui()
             return
         self.psd_edit.setText(str(cfg.get("psd", str(DEFAULT_PSD))))
-        self.out_edit.setText(str(cfg.get("output", str(DEFAULT_OUTPUT))))
+        self.out_edit.setText(format_preferred_path(cfg.get("output", DEFAULT_OUTPUT)))
         self.current_output = self._current_output_path()
         self._populate_names_file_combo()
         names_file = str(cfg.get("names_file", str(NAMES_FILE.resolve())))
         idx = self.names_file_combo.findData(names_file)
         if idx >= 0:
             self.names_file_combo.setCurrentIndex(idx)
-        saved_single_supabase = bool(cfg.get("save_single_supabase", False))
         raw_mode = str(cfg.get("mode", "full"))
-        if raw_mode == "custom" and saved_single_supabase:
-            mode = "single"
-        else:
-            mode = normalize_saved_mode(raw_mode)
+        mode = normalize_saved_mode(raw_mode)
         idx = self.mode_combo.findData(mode)
         if idx >= 0:
             self.mode_combo.setCurrentIndex(idx)
@@ -2451,14 +3204,20 @@ QScrollBar::handle:vertical {
         self.ps_exec_edit.setText(str(cfg.get("ps_exec", "")))
         self.custom_names_edit.setText(str(cfg.get("custom_name", cfg.get("custom_names", ""))))
         self.auto_open_custom_check.setChecked(bool(cfg.get("auto_open_custom", True)))
-        self.save_single_supabase_check.setChecked(mode == "single")
+        self.save_single_supabase_check.setChecked(False)
         self.skip_done_letters_check.setChecked(bool(cfg.get("skip_done_letters", True)))
+        self.request_worker_poll_spin.setValue(int(cfg.get("request_worker_poll_seconds", 10)))
+        self.request_worker_enabled_check.blockSignals(True)
+        self.request_worker_enabled_check.setChecked(bool(cfg.get("request_worker_enabled", False)))
+        self.request_worker_enabled_check.blockSignals(False)
         saved_styles = cfg.get("styles", [])
         for name, cb in self.style_checks.items():
             cb.setChecked(name in saved_styles)
         self._update_style_badge()
         self._set_single_save_result("", "info", visible=False)
+        self._set_request_worker_result("", "info", visible=False)
         self._refresh_single_save_ui()
+        self._refresh_request_worker_ui()
         self.refresh_letter_summary()
         self.refresh_scratch_status()
         self._update_names_file_warning()
@@ -2475,6 +3234,8 @@ QScrollBar::handle:vertical {
 
 
 def main() -> None:
+    if is_request_worker_mode(sys.argv):
+        raise SystemExit(request_worker_runner.main(sys.argv[2:]))
     if is_worker_mode(sys.argv):
         batch_runner.main(sys.argv[2:])
         return

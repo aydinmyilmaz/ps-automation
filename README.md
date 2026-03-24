@@ -1,82 +1,128 @@
-# PS Automation - Single Name Web Renderer
+# PS Automation
 
-Bu proje **batch değil**, tek seferde:
-- kullanıcıdan **1 isim**
-- kullanıcıdan **1 renk seçimi**
-alıp Photoshop ile **transparent PNG** üretir.
+Bu repo artik birden fazla is akisini barindiriyor:
 
-## Özellik
-- Web arayüzü (React + Vite)
-- Backend API (Python)
-- Photoshop script ile gerçek render
-- Renk seçenekleri: `metal`, `ALTIN`, `MAVI`, `PEMBE`
-- Çıktı: backgroundsuz PNG
+- Desktop Qt app
+- Local single-render web API
+- React frontend
+- Website Orders queue worker
+- Photoshop batch scripts
 
-## Gereksinimler
-- macOS
-- Adobe Photoshop 2026 (kurulu)
-- Python 3
-- Node.js + npm
-- Font: `ClarendonBT-Black` (Photoshop içinde görünür olmalı)
+Bu nedenle ana giris noktalari sadece `scripts/` altindadir.
 
-## Tek Komutla Çalıştırma
-Proje kökünde:
+## Python Standardi
+
+Bu repo icin tavsiye edilen ve beklenen Python setup'i:
+
+- `uv`
+- `.venv`
+- `Python 3.11`
+- root'taki [.python-version](.python-version)
+
+Kurulum:
+
+macOS / Linux:
+
+```bash
+uv python install 3.11
+uv venv --python 3.11 .venv
+source .venv/bin/activate
+uv pip install -r requirements-desktop.txt
+```
+
+Windows:
+
+```bat
+uv python install 3.11
+uv venv --python 3.11 .venv
+.venv\Scripts\activate
+uv pip install -r requirements-desktop.txt
+```
+
+Launcher'lar artik `.venv` bekler. Global `python` kurulu olsa bile repo icin canonical akıs `.venv` icinden calismaktir.
+
+## Kisa Repo Yapisi
+
+- `scripts/`
+  - Uygulamanin gercek Python entrypoint'leri burada
+- `frontend/`
+  - React + Vite UI
+- `docs/`
+  - Kurulum ve entegrasyon dokumanlari
+- `config/`
+  - Lokal config dosyalari
+- `data/`
+  - PSD ve bundle edilen veri dosyalari
+
+## En Cok Kullanilan Komutlar
+
+### Desktop Qt app
+
+macOS / Linux:
+
+```bash
+./start_desktop_qt.command
+```
+
+Windows:
+
+```bat
+start_desktop_qt.bat
+```
+
+Manuel:
+
+macOS / Linux:
+
+```bash
+.venv/bin/python scripts/desktop_qt_app.py
+```
+
+Windows:
+
+```bat
+.venv\Scripts\python.exe scripts\desktop_qt_app.py
+```
+
+### Local web API + frontend
 
 ```bash
 bash start.sh
 ```
 
-Bu komut:
-1. API server'ı açar (`http://127.0.0.1:8000`)
-2. React frontend'i açar (`http://127.0.0.1:5173`)
+Bu komut su iki sureci baslatir:
 
-Tarayıcıda:
+- Python API: `scripts/single_render_api.py`
+- React frontend: `frontend/`
 
-```text
-http://127.0.0.1:5173
-```
-
-## Kullanım
-1. Text gir
-2. Renk seç
-3. `Render PNG` bas
-4. Görseli önizle
-5. `Download PNG` ile indir
-
-## Çıktı Konumu
-Üretilen dosyalar:
-
-```text
-output/web_single/
-```
-
-## Durdurma
-Terminalde:
-
-```text
-Ctrl + C
-```
-
-`start.sh` hem API hem frontend süreçlerini birlikte kapatır.
-
-## Manuel Çalıştırma (isteğe bağlı)
-API:
+### API'yi tek basina calistirmak
 
 ```bash
-python3 single_render_api.py
+.venv/bin/python scripts/single_render_api.py
 ```
 
-Frontend:
+## Root Duzeyinde Bilinmesi Gereken Dosyalar
 
-```bash
-cd frontend
-npm run dev
-```
+- `start.sh`
+  - local web API + frontend baslatir
+- `start_desktop_qt.bat`
+  - Windows desktop launcher
+- `start_desktop_qt.command`
+  - macOS desktop launcher
+- `requirements-desktop.txt`
+  - Desktop app dependency listesi
+- `requirements-gmail.txt`
+  - Gmail related tooling dependency listesi
+- `.python-version`
+  - Repo'nun bekledigi Python major/minor versiyonu
 
-## Sorun Giderme
-- `Font missing: ClarendonBT-Black`:
-  - Fontu kur, Photoshop’u kapat/aç.
-- `PSD not found`:
-  - `data/text_only_2.psd` dosyasının yerini kontrol et.
-- Port hatası:
-  - 8000 veya 5173 portunu kullanan başka uygulamayı kapat.
+## Windows Dokumani
+
+Windows'ta desktop app'i calistirmak icin:
+
+- [docs/WINDOWS_DESKTOP_SETUP.md](docs/WINDOWS_DESKTOP_SETUP.md)
+
+## Supabase ve Website Orders Dokumanlari
+
+- [docs/VERCEL_RENDER_REQUEST_QUEUE.md](docs/VERCEL_RENDER_REQUEST_QUEUE.md)
+- [docs/SUPABASE_BULK_NAME_UPLOAD.md](docs/SUPABASE_BULK_NAME_UPLOAD.md)

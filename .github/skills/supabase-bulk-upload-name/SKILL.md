@@ -6,9 +6,9 @@ argument-hint: [input dir(s)] [dry-run or real upload]
 
 # Supabase Bulk Upload Name
 
-Use [scripts/import_ai_text_design_cache.mjs](/Users/aydin/Desktop/apps/ps-automation/scripts/import_ai_text_design_cache.mjs) for this workflow.
+Use [scripts/import_ai_text_design_cache.mjs](../../../scripts/import_ai_text_design_cache.mjs) for this workflow.
 
-Read [references/commands.md](/Users/aydin/Desktop/apps/ps-automation/.github/skills/supabase-bulk-upload-name/references/commands.md) when you need exact commands, verification, or troubleshooting.
+Read [references/commands.md](references/commands.md) when you need exact commands, verification, or troubleshooting.
 
 ## Default assumptions
 

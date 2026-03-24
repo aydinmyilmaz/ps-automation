@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 *.png
 *env*
+.venv/
 .github/*
 !.github/REPO_STRUCTURE.md
 !.github/skills/

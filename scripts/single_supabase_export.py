@@ -26,6 +26,7 @@ BLACK_THRESHOLD = 16
 DEFAULT_STORAGE_BUCKET = "generated-maps"
 DEFAULT_CACHE_TABLE = "ai_text_design_cache"
 DEFAULT_STORAGE_FOLDER = "ai-text-design-cache"
+DEFAULT_REQUEST_TABLE = "render_requests"
 STYLE_COLOR_KEYS = {
     "Black": "black_silver",
     "Gray": "silver_gray",
@@ -53,6 +54,7 @@ class SupabaseSingleSaveConfig:
     storage_bucket: str = DEFAULT_STORAGE_BUCKET
     cache_table: str = DEFAULT_CACHE_TABLE
     storage_folder: str = DEFAULT_STORAGE_FOLDER
+    request_table: str = DEFAULT_REQUEST_TABLE
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,10 @@ class UploadItemResult:
     color_key: str
     status: str
     message: str
+    cache_key: str = ""
+    image_url: str = ""
+    storage_path: str = ""
+    image_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -137,6 +143,7 @@ def load_single_save_config() -> SupabaseSingleSaveConfig:
         storage_bucket=str(data.get("storageBucket", DEFAULT_STORAGE_BUCKET)).strip() or DEFAULT_STORAGE_BUCKET,
         cache_table=str(data.get("cacheTable", DEFAULT_CACHE_TABLE)).strip() or DEFAULT_CACHE_TABLE,
         storage_folder=str(data.get("storageFolder", DEFAULT_STORAGE_FOLDER)).strip() or DEFAULT_STORAGE_FOLDER,
+        request_table=str(data.get("requestTable", DEFAULT_REQUEST_TABLE)).strip() or DEFAULT_REQUEST_TABLE,
     )
 
 
@@ -230,13 +237,15 @@ def upload_storage_object(
 def postgrest_select(
     config: SupabaseSingleSaveConfig,
     *,
+    table: str | None = None,
     filters: dict[str, str],
     select: str,
     timeout_seconds: int = 30,
 ) -> list[dict[str, object]]:
     query = {"select": select}
     query.update(filters)
-    url = f"{config.supabase_url}/rest/v1/{config.cache_table}?{parse.urlencode(query)}"
+    table_name = table or config.cache_table
+    url = f"{config.supabase_url}/rest/v1/{table_name}?{parse.urlencode(query)}"
     data = http_json(url, headers=config_headers(config), timeout_seconds=timeout_seconds)
     if isinstance(data, list):
         return data
@@ -247,9 +256,11 @@ def postgrest_insert(
     config: SupabaseSingleSaveConfig,
     row: dict[str, object],
     *,
+    table: str | None = None,
     timeout_seconds: int = 60,
 ) -> list[dict[str, object]]:
-    url = f"{config.supabase_url}/rest/v1/{config.cache_table}"
+    table_name = table or config.cache_table
+    url = f"{config.supabase_url}/rest/v1/{table_name}"
     payload = json.dumps(row).encode("utf-8")
     data = http_json(
         url,
@@ -261,6 +272,30 @@ def postgrest_insert(
     if isinstance(data, list):
         return data
     raise RuntimeError("Unexpected Supabase insert response shape.")
+
+
+def postgrest_update(
+    config: SupabaseSingleSaveConfig,
+    *,
+    row: dict[str, object],
+    filters: dict[str, str],
+    table: str | None = None,
+    timeout_seconds: int = 60,
+) -> list[dict[str, object]]:
+    table_name = table or config.cache_table
+    query = parse.urlencode(filters)
+    url = f"{config.supabase_url}/rest/v1/{table_name}?{query}"
+    payload = json.dumps(row).encode("utf-8")
+    data = http_json(
+        url,
+        method="PATCH",
+        headers=config_headers(config, content_type="application/json", prefer="return=representation"),
+        payload=payload,
+        timeout_seconds=timeout_seconds,
+    )
+    if isinstance(data, list):
+        return data
+    raise RuntimeError("Unexpected Supabase update response shape.")
 
 
 def convert_black_to_alpha_png(image_path: Path, threshold: int = BLACK_THRESHOLD) -> bytes:
@@ -300,7 +335,7 @@ def existing_cache_key_rows(
     return postgrest_select(
         config,
         filters={"cache_key": f"eq.{cache_key}", "limit": "1"},
-        select="id,image_hash",
+        select="id,image_hash,image_url,storage_path,cache_key",
         timeout_seconds=timeout_seconds,
     )
 
@@ -310,16 +345,23 @@ def import_archived_run(archived_run: ArchivedRun, timeout_seconds: int = 120) -
     items: list[UploadItemResult] = []
 
     for render in archived_run.archived_renders:
+        cache_key = ""
         try:
             color_key = resolve_color_key(render.style)
             cache_key = build_cache_key(MODEL_NAME, archived_run.target_text, color_key)
-            if existing_cache_key_rows(config, cache_key, timeout_seconds=timeout_seconds):
+            existing = existing_cache_key_rows(config, cache_key, timeout_seconds=timeout_seconds)
+            if existing:
+                existing_row = existing[0] if existing else {}
                 items.append(
                     UploadItemResult(
                         style=render.style,
                         color_key=color_key,
                         status="skipped",
                         message="existing cache_key found",
+                        cache_key=str(existing_row.get("cache_key") or cache_key),
+                        image_url=str(existing_row.get("image_url") or ""),
+                        storage_path=str(existing_row.get("storage_path") or ""),
+                        image_hash=str(existing_row.get("image_hash") or ""),
                     )
                 )
                 continue
@@ -347,6 +389,10 @@ def import_archived_run(archived_run: ArchivedRun, timeout_seconds: int = 120) -
                     color_key=color_key,
                     status="uploaded",
                     message=f"hash={image_hash[:12]}",
+                    cache_key=cache_key,
+                    image_url=public_url_for(config, storage_path),
+                    storage_path=storage_path,
+                    image_hash=image_hash,
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -357,6 +403,7 @@ def import_archived_run(archived_run: ArchivedRun, timeout_seconds: int = 120) -
                     color_key=fallback_color,
                     status="failed",
                     message=str(exc),
+                    cache_key=cache_key,
                 )
             )
 

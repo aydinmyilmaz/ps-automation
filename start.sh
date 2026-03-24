@@ -6,6 +6,7 @@ API_HOST="127.0.0.1"
 API_PORT="8000"
 WEB_PORT="5173"
 API_PID=""
+PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
 
 require_cmd() {
   local cmd="$1"
@@ -34,7 +35,6 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-require_cmd python3
 require_cmd node
 require_cmd npm
 
@@ -43,13 +43,23 @@ check_port_free "$WEB_PORT"
 
 mkdir -p "$ROOT_DIR/output/web_single"
 
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "[ERROR] .venv not found." >&2
+  echo "[INFO] Set up this repo with uv and Python 3.11 first:" >&2
+  echo "[INFO]   uv python install 3.11" >&2
+  echo "[INFO]   uv venv --python 3.11 .venv" >&2
+  echo "[INFO]   source .venv/bin/activate" >&2
+  echo "[INFO]   uv pip install -r requirements-desktop.txt" >&2
+  exit 1
+fi
+
 if [[ ! -d "$ROOT_DIR/frontend/node_modules" ]]; then
   echo "[INFO] Installing frontend dependencies..."
   (cd "$ROOT_DIR/frontend" && npm install)
 fi
 
 echo "[INFO] Starting API on http://$API_HOST:$API_PORT ..."
-python3 "$ROOT_DIR/single_render_api.py" &
+"$PYTHON_BIN" "$ROOT_DIR/scripts/single_render_api.py" &
 API_PID="$!"
 
 sleep 1

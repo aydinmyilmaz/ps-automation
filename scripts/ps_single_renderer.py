@@ -424,6 +424,8 @@ def run_jsx(jsx: str, timeout_seconds: int = 3600) -> str:
 def render_name(
     text: str,
     style: str,
+    psd_path: Path | None = None,
+    output_dir: Path | None = None,
     keep_psd_open: bool = KEEP_PSD_OPEN,
     fast_export_no_trim: bool = FAST_EXPORT_NO_TRIM,
     restore_history_state: bool = RESTORE_HISTORY_STATE,
@@ -432,16 +434,18 @@ def render_name(
         raise ValueError("Invalid style")
     if not text.strip():
         raise ValueError("Text cannot be empty")
-    if not PSD_PATH.exists():
-        raise FileNotFoundError(f"PSD not found: {PSD_PATH}")
+    resolved_psd = (psd_path or PSD_PATH).expanduser().resolve()
+    if not resolved_psd.exists():
+        raise FileNotFoundError(f"PSD not found: {resolved_psd}")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    resolved_output_dir = (output_dir or OUTPUT_DIR).expanduser().resolve()
+    resolved_output_dir.mkdir(parents=True, exist_ok=True)
     safe = sanitize_filename(text)
     safe_style = sanitize_filename(style)
-    out = OUTPUT_DIR / f"{safe}_{safe_style}_{int(time.time())}.png"
+    out = resolved_output_dir / f"{safe}_{safe_style}_{int(time.time())}.png"
     result = run_jsx(
         build_jsx(
-            PSD_PATH,
+            resolved_psd,
             out,
             text.strip(),
             style,

@@ -1,10 +1,10 @@
 # Supabase Bulk Name Upload
 
-Bu repo, klasor bazli PSD name PNG ciktularini `ai_text_design_cache` tablosuna toplu yuklemek icin [scripts/import_ai_text_design_cache.mjs](/Users/aydin/Desktop/apps/ps-automation/scripts/import_ai_text_design_cache.mjs) scriptini kullanir.
+Bu repo, klasor bazli PSD name PNG ciktularini `ai_text_design_cache` tablosuna toplu yuklemek icin [scripts/import_ai_text_design_cache.mjs](../scripts/import_ai_text_design_cache.mjs) scriptini kullanir.
 
 ## Kullandigi kaynaklar
 
-- Supabase config: [config/supabase_single_save.example.json](/Users/aydin/Desktop/apps/ps-automation/config/supabase_single_save.example.json)
+- Supabase config: [config/supabase_single_save.example.json](../config/supabase_single_save.example.json)
 - Lokal config: `config/supabase_single_save.json`
 - Varsayilan model: `ps-desktop-name-png-v1`
 - Varsayilan design name: `bootleg_2026`
