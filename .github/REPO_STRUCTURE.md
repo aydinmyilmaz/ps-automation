@@ -42,6 +42,7 @@ ps-automation/
 ├── start.sh                   # Launch web app (API + frontend)
 ├── start_desktop_qt.command   # Launch Qt batch app (macOS)
 ├── start_desktop_qt.bat       # Launch Qt batch app (Windows)
+├── .python-version            # Canonical repo Python version
 ├── package.json               # npm scripts wrapper
 ├── requirements-desktop.txt   # Python deps for desktop apps
 └── .gitignore
@@ -93,6 +94,7 @@ Everything in `output/` is gitignored and reproducible.
 - `data/final_names/` (name lists)
 - `data/psd-files/` (large PSD archive)
 - `data/selected-psd/` (active PSD, too large for git)
+- `.venv/` and other local virtual environments
 - `archive/` (deprecated code)
 - `credentials/` and local `config/*.json`
 - `.env.local` and similar local env files

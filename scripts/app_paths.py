@@ -70,6 +70,10 @@ def default_web_output_dir() -> Path:
     return default_output_base() / "web_single"
 
 
+def default_request_worker_dir() -> Path:
+    return default_output_base() / "request_worker"
+
+
 def default_single_supabase_export_dir() -> Path:
     return desktop_dir() / "ps_single_supabase_exports"
 
